@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 import urllib.request
@@ -19,6 +20,7 @@ load_dotenv()
 TRANSCRIPTS_DIR = Path("transcripts")
 MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
+LITELLM_PRICES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
 SYSTEM_PROMPT_TEMPLATE = """You are a helpful assistant answering questions about a YouTube video.
 Here is the full transcript:
@@ -118,6 +120,19 @@ Input {
 """
 
 
+def fetch_model_pricing(model: str) -> tuple[float, float] | None:
+    try:
+        req = urllib.request.Request(LITELLM_PRICES_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        entry = data.get(model)
+        if entry is None:
+            return None
+        return (entry["input_cost_per_token"], entry["output_cost_per_token"])
+    except Exception:
+        return None
+
+
 def extract_video_id(url: str) -> str:
     parsed = urlparse(url)
     if parsed.hostname in ("youtu.be",):
@@ -192,6 +207,7 @@ class YtqaApp(App):
         transcript_from_cache: bool,
         system_prompt: str,
         client: anthropic.Anthropic,
+        pricing: tuple[float, float] | None,
     ) -> None:
         super().__init__()
         self._video_id = video_id
@@ -200,6 +216,8 @@ class YtqaApp(App):
         self._transcript_from_cache = transcript_from_cache
         self._system_prompt = system_prompt
         self._client = client
+        self._pricing = pricing
+        self._total_cost: float = 0.0
         self._messages: list[dict] = []
         self._thinking_widget: ChatMessage | None = None
         self._summary_header: Static | None = None
@@ -210,9 +228,22 @@ class YtqaApp(App):
         yield VerticalScroll(id="chat-log")
         yield Input(placeholder="Ask a question…", id="input-bar")
 
+    def _accumulate_cost(self, input_tokens: int, output_tokens: int) -> None:
+        if self._pricing is None:
+            return
+        price_in, price_out = self._pricing
+        self._total_cost += input_tokens * price_in + output_tokens * price_out
+        self._refresh_cost_display()
+
+    def _refresh_cost_display(self) -> None:
+        if self._pricing is None:
+            self.sub_title = f"{self._video_id}  •  cost unavailable"
+        else:
+            self.sub_title = f"{self._video_id}  •  ${self._total_cost:.4f}"
+
     def on_mount(self) -> None:
         self.title = "ytqa"
-        self.sub_title = self._video_id
+        self._refresh_cost_display()
         self.query_one("#input-bar", Input).focus()
 
         cache_label = "[dim]transcript cached[/dim]" if self._transcript_from_cache else "[dim]transcript fetched[/dim]"
@@ -238,11 +269,13 @@ class YtqaApp(App):
             messages=[{"role": "user", "content": SUMMARY_PROMPT}],
         )
         summary = response.content[0].text
-        self.call_from_thread(self._post_summary, summary)
+        usage = response.usage
+        self.call_from_thread(self._post_summary, summary, usage.input_tokens, usage.output_tokens)
 
-    def _post_summary(self, summary: str) -> None:
+    def _post_summary(self, summary: str, input_tokens: int, output_tokens: int) -> None:
         if self._summary_body is not None:
             self._summary_body.update(summary)
+        self._accumulate_cost(input_tokens, output_tokens)
 
     @on(Input.Submitted, "#input-bar")
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -270,15 +303,17 @@ class YtqaApp(App):
             messages=self._messages,
         )
         reply_text = response.content[0].text
-        self.call_from_thread(self._post_reply, reply_text)
+        usage = response.usage
+        self.call_from_thread(self._post_reply, reply_text, usage.input_tokens, usage.output_tokens)
 
-    def _post_reply(self, reply_text: str) -> None:
+    def _post_reply(self, reply_text: str, input_tokens: int, output_tokens: int) -> None:
         if self._thinking_widget is not None:
             self._thinking_widget.remove()
             self._thinking_widget = None
 
         self._messages.append({"role": "assistant", "content": reply_text})
         self._append_message("assistant", reply_text)
+        self._accumulate_cost(input_tokens, output_tokens)
 
     def _append_message(self, role: str, content: str) -> None:
         widget = ChatMessage(role, content)
@@ -302,6 +337,7 @@ def main() -> None:
 
     client = anthropic.Anthropic()
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(transcript=transcript)
+    pricing = fetch_model_pricing(MODEL)
 
     app = YtqaApp(
         video_id=video_id,
@@ -310,6 +346,7 @@ def main() -> None:
         transcript_from_cache=from_cache,
         system_prompt=system_prompt,
         client=client,
+        pricing=pricing,
     )
     app.run()
 
