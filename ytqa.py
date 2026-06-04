@@ -28,6 +28,7 @@ Here is the full transcript:
 {transcript}
 
 Answer based on the transcript. If something isn't in the transcript, say so clearly.
+Respond in the same language as the transcript.
 When using abbreviations or acronyms, always spell them out in full the first time they appear in your response, e.g. "ABV (Alcohol By Volume)"."""
 
 SUMMARY_PROMPT = """\
