@@ -160,9 +160,27 @@ def fetch_video_title(video_id: str) -> str:
     return video_id
 
 
+def pick_transcript(available: list) -> object:
+    if len(available) == 1:
+        return available[0]
+
+    print("\nMultiple transcripts available:")
+    for i, t in enumerate(available):
+        kind = "manual" if not t.is_generated else "auto-generated"
+        print(f"  [{i + 1}] {t.language} ({t.language_code}) — {kind}")
+
+    while True:
+        choice = input(f"Choose [1-{len(available)}]: ").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(available):
+            return available[int(choice) - 1]
+
+
 def fetch_and_save_transcript(video_id: str) -> str:
     api = YouTubeTranscriptApi()
-    fetched = api.fetch(video_id)
+    transcript_list = api.list(video_id)
+    available = list(transcript_list)
+    chosen = pick_transcript(available)
+    fetched = chosen.fetch()
     transcript = " ".join(s.text for s in fetched)
 
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
