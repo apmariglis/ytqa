@@ -265,6 +265,7 @@ class YtqaApp(App):
         response = self._client.messages.create(
             model=MODEL,
             max_tokens=256,
+            temperature=0,
             system=self._system_prompt,
             messages=[{"role": "user", "content": SUMMARY_PROMPT}],
         )
@@ -299,6 +300,7 @@ class YtqaApp(App):
         response = self._client.messages.create(
             model=MODEL,
             max_tokens=MAX_TOKENS,
+            temperature=0,
             system=self._system_prompt,
             messages=self._messages,
         )
