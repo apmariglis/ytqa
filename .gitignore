@@ -1,1 +1,4 @@
 .env
+tmp/
+transcripts/
+__pycache__/
