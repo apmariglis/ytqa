@@ -285,7 +285,7 @@ class YtqaApp(App):
     def _fetch_summary(self) -> None:
         response = self._client.messages.create(
             model=self._model,
-            max_tokens=256,
+            max_tokens=MAX_TOKENS,
             temperature=0,
             system=self._system_prompt,
             messages=[{"role": "user", "content": SUMMARY_PROMPT}],
