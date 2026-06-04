@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import sys
 import urllib.request
@@ -18,7 +19,6 @@ from textual.markup import escape
 load_dotenv()
 
 TRANSCRIPTS_DIR = Path("transcripts")
-MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 2048
 LITELLM_PRICES_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"
 
@@ -207,6 +207,7 @@ class YtqaApp(App):
         transcript_from_cache: bool,
         system_prompt: str,
         client: anthropic.Anthropic,
+        model: str,
         pricing: tuple[float, float] | None,
     ) -> None:
         super().__init__()
@@ -216,6 +217,7 @@ class YtqaApp(App):
         self._transcript_from_cache = transcript_from_cache
         self._system_prompt = system_prompt
         self._client = client
+        self._model = model
         self._pricing = pricing
         self._total_cost: float = 0.0
         self._messages: list[dict] = []
@@ -263,7 +265,7 @@ class YtqaApp(App):
     @work(thread=True)
     def _fetch_summary(self) -> None:
         response = self._client.messages.create(
-            model=MODEL,
+            model=self._model,
             max_tokens=256,
             temperature=0,
             system=self._system_prompt,
@@ -298,7 +300,7 @@ class YtqaApp(App):
     @work(thread=True)
     def _fetch_reply(self, question: str) -> None:
         response = self._client.messages.create(
-            model=MODEL,
+            model=self._model,
             max_tokens=MAX_TOKENS,
             temperature=0,
             system=self._system_prompt,
@@ -337,9 +339,10 @@ def main() -> None:
     title = fetch_video_title(video_id)
     transcript, from_cache = load_transcript(video_id)
 
+    model = os.environ["YTQA_MODEL"]
     client = anthropic.Anthropic()
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(transcript=transcript)
-    pricing = fetch_model_pricing(MODEL)
+    pricing = fetch_model_pricing(model)
 
     app = YtqaApp(
         video_id=video_id,
@@ -348,6 +351,7 @@ def main() -> None:
         transcript_from_cache=from_cache,
         system_prompt=system_prompt,
         client=client,
+        model=model,
         pricing=pricing,
     )
     app.run()
