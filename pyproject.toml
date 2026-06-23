@@ -8,4 +8,14 @@ dependencies = [
     "anthropic",
     "python-dotenv>=1.2.2",
     "textual>=8.2.7",
+    "yt-dlp",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-mock",
 ]
