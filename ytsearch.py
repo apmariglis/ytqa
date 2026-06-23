@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 
 import yt_dlp
@@ -107,6 +108,27 @@ Input {
     dock: bottom;
 }
 """
+
+
+_RETRYABLE_STATUS_CODES = {429, 529}
+_MAX_API_RETRIES = 5
+
+
+def _create_with_retry(client, status_callback=None, **kwargs):
+    for attempt in range(_MAX_API_RETRIES):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            is_retryable = isinstance(status_code, int) and status_code in _RETRYABLE_STATUS_CODES
+            has_attempts_left = attempt < _MAX_API_RETRIES - 1
+            if is_retryable and has_attempts_left:
+                wait = 2 ** attempt
+                if status_callback:
+                    status_callback(f"API overloaded — retrying in {wait}s…", "info")
+                time.sleep(wait)
+            else:
+                raise
 
 
 class SearchError(Exception):
@@ -223,7 +245,9 @@ def run_agent_loop(
     # --- Phase 1: search loop ---
     search_end_text = ""
     while True:
-        response = client.messages.create(
+        response = _create_with_retry(
+            client,
+            status_callback,
             model=model,
             max_tokens=MAX_TOKENS,
             system=SEARCH_SYSTEM_PROMPT,
@@ -414,7 +438,9 @@ def run_agent_loop(
         }
     ]
 
-    synthesis_response = client.messages.create(
+    synthesis_response = _create_with_retry(
+        client,
+        status_callback,
         model=model,
         max_tokens=SYNTHESIS_MAX_TOKENS,
         system=SYNTHESIS_SYSTEM_PROMPT,

@@ -9,6 +9,7 @@ Group E  — fetch_transcripts_for_videos()
 Group F  — run_agent_loop() search phase
 Group G  — run_agent_loop() synthesis phase
 Group L  — run_agent_loop() session logging integration
+Group M  — _create_with_retry() transient error handling
 Group J  — main() entry point
 """
 
@@ -716,6 +717,123 @@ def test_run_agent_loop_includes_timestamps_in_synthesis_when_segments_available
     )
     # 135 seconds → [2:15] from SEGMENTS_WITH_TIMESTAMPS
     assert "[2:15]" in combined_content
+
+
+# ===========================================================================
+# Group M — _create_with_retry() transient error handling
+# ===========================================================================
+
+# A fake exception that mimics the shape of Anthropic SDK HTTP errors,
+# which expose the HTTP status code via a `.status_code` attribute.
+
+class _FakeAPIError(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+def _make_retrying_client(failing_status_code: int, fail_times: int, success_response):
+    """Client whose .messages.create raises an HTTP error `fail_times` times then succeeds."""
+    call_count = 0
+
+    def _create(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= fail_times:
+            raise _FakeAPIError(failing_status_code)
+        return success_response
+
+    client = MagicMock()
+    client.messages.create.side_effect = _create
+    return client
+
+
+def test_create_with_retry_returns_response_on_first_success(mocker):
+    # When the API succeeds immediately, the response is returned without retrying.
+    mocker.patch("ytsearch.time.sleep")
+    client = MagicMock()
+    expected = MagicMock()
+    client.messages.create.return_value = expected
+
+    result = ytsearch._create_with_retry(client, model="m", messages=[])
+
+    assert result is expected
+
+
+def test_create_with_retry_retries_on_529_and_eventually_succeeds(mocker):
+    # A single 529 (overloaded) should be retried and succeed on the next attempt.
+    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    success = MagicMock()
+    client = _make_retrying_client(failing_status_code=529, fail_times=1, success_response=success)
+
+    result = ytsearch._create_with_retry(client, model="m", messages=[])
+
+    assert result is success
+    mock_sleep.assert_called_once()
+
+
+def test_create_with_retry_retries_on_429_and_eventually_succeeds(mocker):
+    # 429 (rate limited) is also retryable and should be handled the same way.
+    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    success = MagicMock()
+    client = _make_retrying_client(failing_status_code=429, fail_times=1, success_response=success)
+
+    result = ytsearch._create_with_retry(client, model="m", messages=[])
+
+    assert result is success
+    mock_sleep.assert_called_once()
+
+
+def test_create_with_retry_uses_exponential_backoff(mocker):
+    # Each retry waits 2^attempt seconds: 1st retry waits 1s, 2nd waits 2s.
+    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    success = MagicMock()
+    client = _make_retrying_client(failing_status_code=529, fail_times=2, success_response=success)
+
+    ytsearch._create_with_retry(client, model="m", messages=[])
+
+    sleep_calls = [call.args[0] for call in mock_sleep.call_args_list]
+    assert sleep_calls == [1, 2]
+
+
+def test_create_with_retry_raises_after_max_retries_exhausted(mocker):
+    # If the API keeps returning 529 beyond the retry limit, the error propagates.
+    mocker.patch("ytsearch.time.sleep")
+    client = MagicMock()
+    client.messages.create.side_effect = _FakeAPIError(529)
+
+    with pytest.raises(_FakeAPIError):
+        ytsearch._create_with_retry(client, model="m", messages=[])
+
+
+def test_create_with_retry_does_not_retry_non_transient_errors(mocker):
+    # A 400 bad request should not be retried — it is a permanent client error.
+    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    client = MagicMock()
+    client.messages.create.side_effect = _FakeAPIError(400)
+
+    with pytest.raises(_FakeAPIError):
+        ytsearch._create_with_retry(client, model="m", messages=[])
+
+    mock_sleep.assert_not_called()
+
+
+def test_create_with_retry_notifies_status_callback_before_each_retry(mocker):
+    # Status callback is called so the TUI can show the user a "retrying" message.
+    mocker.patch("ytsearch.time.sleep")
+    success = MagicMock()
+    client = _make_retrying_client(failing_status_code=529, fail_times=1, success_response=success)
+    status_events: list[tuple[str, str]] = []
+
+    ytsearch._create_with_retry(
+        client,
+        lambda msg, kind="info": status_events.append((msg, kind)),
+        model="m",
+        messages=[],
+    )
+
+    assert len(status_events) == 1
+    assert "retry" in status_events[0][0].lower() or "overload" in status_events[0][0].lower()
 
 
 # ===========================================================================
