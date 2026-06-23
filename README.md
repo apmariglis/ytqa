@@ -1,6 +1,9 @@
-# ytqa — YouTube Transcript Q&A
+# ytqa + ytsearch — YouTube Transcript Tools
 
-Ask Claude questions about any YouTube video using its transcript.
+Two Claude-powered TUI tools for learning from YouTube:
+
+- **`ytqa`** — Q&A a single video you already know
+- **`ytsearch`** — Describe what you want to learn; an agent searches YouTube, reads transcripts, and synthesises a cited answer
 
 ## Requirements
 
@@ -10,7 +13,7 @@ Ask Claude questions about any YouTube video using its transcript.
 ## Setup
 
 ```bash
-uv venv && uv add youtube-transcript-api anthropic python-dotenv textual
+uv sync
 ```
 
 Create a `.env` file in the project root:
@@ -22,22 +25,40 @@ YTQA_MODEL=claude-sonnet-4-6
 
 ## Usage
 
+### ytqa — single-video Q&A
+
 ```bash
 uv run python ytqa.py https://www.youtube.com/watch?v=VIDEO_ID
-```
-
-Or with a short URL:
-
-```bash
+# or
 uv run python ytqa.py https://youtu.be/VIDEO_ID
 ```
 
-You'll be dropped into an interactive TUI. Press `Ctrl+Q` to exit.
+Launches an interactive chat TUI. A summary of the video is shown on load, then you can ask follow-up questions. Press `Ctrl+Q` to exit.
+
+### ytsearch — agentic search
+
+```bash
+uv run python ytsearch.py "how does Python's GIL work"
+```
+
+Or run without arguments to be prompted:
+
+```bash
+uv run python ytsearch.py
+```
+
+The agent searches YouTube with one or more refined queries, fetches transcripts for the most promising videos, and returns a Markdown answer with citations. Progress is shown in the TUI as it works. Press `Ctrl+Q` to exit.
 
 ## Notes
 
-- The video must have captions/subtitles available.
-- If a video has multiple transcript tracks, you'll be prompted to choose one before the TUI launches.
-- Responses are in the same language as the transcript.
-- Transcripts are cached in `transcripts/<video_id>.txt` — re-running the same URL skips the fetch.
-- Running cost is shown in the header subtitle, updated after each API call.
+- Videos must have captions/subtitles available.
+- If a video has multiple transcript tracks, you'll be prompted to choose one before the TUI launches (ytqa only).
+- `ytqa` responses are in the same language as the transcript.
+- Transcripts are cached in `transcripts/<video_id>.txt` — subsequent runs reuse the cached file.
+- `ytqa` shows running API cost in the header, updated after each call.
+
+## Running tests
+
+```bash
+uv run pytest tests/ -v
+```
