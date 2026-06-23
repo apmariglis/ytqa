@@ -8,6 +8,7 @@ Group D  — build_search_tool_definition()
 Group E  — fetch_transcripts_for_videos()
 Group F  — run_agent_loop() search phase
 Group G  — run_agent_loop() synthesis phase
+Group L  — run_agent_loop() session logging integration
 Group J  — main() entry point
 """
 
@@ -29,6 +30,7 @@ from ytsearch import (
     run_agent_loop,
     search_youtube,
 )
+from ytlog import SessionLog
 
 
 # ---------------------------------------------------------------------------
@@ -753,3 +755,111 @@ def test_main_prompts_for_query_via_input_when_no_argument_given(mocker):
     mock_app_class.assert_called_once()
     call_kwargs = mock_app_class.call_args.kwargs
     assert call_kwargs["initial_query"] == "what is asyncio"
+
+
+# ===========================================================================
+# Group L — run_agent_loop() session logging integration
+# ===========================================================================
+
+def test_run_agent_loop_records_claude_search_response_in_session_log(mocker):
+    # Every Claude response in the search phase must be captured so we can
+    # see Claude's reasoning (text blocks) and tool calls when reviewing logs.
+    mocker.patch("ytsearch.search_youtube", return_value=[])
+    client = _make_client(
+        _end_turn_response('<selected_videos>[]</selected_videos>'),
+        _make_synthesis_response("No results."),
+    )
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
+
+    response_events = [e for e in log.events if e["type"] == "claude_search_response"]
+    assert len(response_events) >= 1
+    assert "stop_reason" in response_events[0]
+    assert "content" in response_events[0]
+
+
+def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(mocker):
+    # Recording the query and results makes it possible to judge whether
+    # Claude chose good search terms.
+    search_result = VideoResult(
+        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
+    )
+    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
+    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
+    mocker.patch("ytsearch.load_transcript_segments", return_value=None)
+    client = _make_client(
+        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
+        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _make_synthesis_response(SYNTHESIS_ANSWER),
+    )
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
+
+    search_events = [e for e in log.events if e["type"] == "youtube_search"]
+    assert len(search_events) == 1
+    assert search_events[0]["query"] == "Python GIL"
+    assert any(r["video_id"] == SELECTED_VIDEO_ID for r in search_events[0]["results"])
+
+
+def test_run_agent_loop_records_transcript_fetch_success_in_session_log(mocker):
+    # Success events let us see which videos actually contributed to the answer.
+    client, _ = _setup_synthesis_scenario(mocker)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
+
+    fetch_events = [e for e in log.events if e["type"] == "transcript_fetch"]
+    assert any(e["status"] == "success" for e in fetch_events)
+    assert any(e["video_id"] == SELECTED_VIDEO_ID for e in fetch_events)
+
+
+def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker):
+    # No-captions events explain gaps in the final answer during review.
+    from youtube_transcript_api import CouldNotRetrieveTranscript
+
+    search_result = VideoResult(
+        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
+    )
+    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
+    mocker.patch("ytsearch.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
+    client = _make_client(
+        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
+        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _make_synthesis_response(SYNTHESIS_ANSWER),
+    )
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
+
+    fetch_events = [e for e in log.events if e["type"] == "transcript_fetch"]
+    assert any(e["status"] == "no_captions" for e in fetch_events)
+
+
+def test_run_agent_loop_records_synthesis_input_with_transcript_context(mocker):
+    # The full transcript context passed to the synthesis call must be logged
+    # so reviewers can judge whether Claude had enough information.
+    client, _ = _setup_synthesis_scenario(mocker)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
+
+    synthesis_input_events = [e for e in log.events if e["type"] == "synthesis_input"]
+    assert len(synthesis_input_events) == 1
+    assert SELECTED_TRANSCRIPT in synthesis_input_events[0]["transcript_context"]
+
+
+def test_run_agent_loop_records_synthesis_output_answer_in_session_log(mocker):
+    # The final answer is stored verbatim so log files are self-contained
+    # for offline evaluation without re-running the agent.
+    client, _ = _setup_synthesis_scenario(mocker)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
+
+    synthesis_output_events = [e for e in log.events if e["type"] == "synthesis_output"]
+    assert len(synthesis_output_events) == 1
+    assert synthesis_output_events[0]["answer"] == SYNTHESIS_ANSWER

@@ -22,6 +22,7 @@ from ytlib import (
     format_transcript_with_timestamps,
     MAX_TOKENS,
 )
+from ytlog import SessionLog, serialize_content
 
 load_dotenv()
 
@@ -210,6 +211,7 @@ def run_agent_loop(
     client,
     model: str,
     status_callback=None,
+    session_log: SessionLog | None = None,
 ) -> str:
     messages = [{"role": "user", "content": user_query}]
     tools = [build_search_tool_definition()]
@@ -230,6 +232,13 @@ def run_agent_loop(
         )
 
         messages.append({"role": "assistant", "content": response.content})
+
+        if session_log:
+            session_log.record(
+                "claude_search_response",
+                stop_reason=response.stop_reason,
+                content=serialize_content(response.content),
+            )
 
         if response.stop_reason == "end_turn":
             for block in response.content:
@@ -258,6 +267,16 @@ def run_agent_loop(
                     for r in results:
                         status_callback(f'Found: "{r.title}" — {r.url}', "found")
 
+                if session_log:
+                    session_log.record(
+                        "youtube_search",
+                        query=query,
+                        results=[
+                            {"video_id": r.video_id, "title": r.title, "url": r.url}
+                            for r in results
+                        ],
+                    )
+
                 results_data = [
                     {
                         "video_id": r.video_id,
@@ -276,6 +295,8 @@ def run_agent_loop(
                     }
                 )
             except SearchError as exc:
+                if session_log:
+                    session_log.record("youtube_search_error", query=query, error=str(exc))
                 tool_results.append(
                     {
                         "type": "tool_result",
@@ -294,20 +315,43 @@ def run_agent_loop(
     # Fetch each transcript individually so we can report progress per video.
     transcripts: dict[str, str] = {}
 
-    def _fetch_one(video_id: str, title: str) -> None:
+    def _fetch_one(video_id: str, title: str, is_fallback: bool = False) -> None:
         if status_callback:
-            status_callback(f"Fetching transcript: {title}…", "info")
+            label = f"Trying alternative: {title}…" if is_fallback else f"Fetching transcript: {title}…"
+            status_callback(label, "info")
         try:
             text, _ = load_transcript(video_id)
             transcripts[video_id] = text
             if status_callback:
                 status_callback(f"Loaded: {title}", "success")
+            if session_log:
+                session_log.record(
+                    "transcript_fetch",
+                    video_id=video_id,
+                    title=title,
+                    status="fallback" if is_fallback else "success",
+                )
         except CouldNotRetrieveTranscript:
-            if status_callback:
+            if status_callback and not is_fallback:
                 status_callback(f"No captions: {title}", "skip")
-        except Exception:
-            if status_callback:
+            if session_log:
+                session_log.record(
+                    "transcript_fetch",
+                    video_id=video_id,
+                    title=title,
+                    status="no_captions",
+                )
+        except Exception as exc:
+            if status_callback and not is_fallback:
                 status_callback(f"Failed: {title}", "error")
+            if session_log:
+                session_log.record(
+                    "transcript_fetch",
+                    video_id=video_id,
+                    title=title,
+                    status="failed",
+                    error=str(exc),
+                )
 
     for video_id in selected_ids:
         video = all_video_results.get(video_id)
@@ -324,15 +368,7 @@ def run_agent_loop(
             if len(transcripts) >= TARGET_TRANSCRIPT_COUNT:
                 break
             video = all_video_results[video_id]
-            if status_callback:
-                status_callback(f"Trying alternative: {video.title}…", "info")
-            try:
-                text, _ = load_transcript(video_id)
-                transcripts[video_id] = text
-                if status_callback:
-                    status_callback(f"Loaded: {video.title}", "success")
-            except Exception:
-                pass
+            _fetch_one(video_id, video.title, is_fallback=True)
 
     transcript_sections = []
     for video_id, text in transcripts.items():
@@ -356,6 +392,17 @@ def run_agent_loop(
 
     transcript_context = "\n\n---\n\n".join(transcript_sections)
 
+    if session_log:
+        session_log.record(
+            "synthesis_input",
+            selected_ids=selected_ids,
+            transcripts_loaded=[
+                {"video_id": vid, "title": all_video_results[vid].title if vid in all_video_results else vid}
+                for vid in transcripts
+            ],
+            transcript_context=transcript_context,
+        )
+
     synthesis_messages = [
         {
             "role": "user",
@@ -374,7 +421,12 @@ def run_agent_loop(
         messages=synthesis_messages,
     )
 
-    return synthesis_response.content[0].text
+    answer = synthesis_response.content[0].text
+
+    if session_log:
+        session_log.record("synthesis_output", answer=answer)
+
+    return answer
 
 
 class YtsearchApp(App):
@@ -417,12 +469,15 @@ class YtsearchApp(App):
 
     @work(thread=True)
     def _run_search(self, query: str) -> None:
+        log = SessionLog(query=query, model=self._model)
+
         def status_callback(message: str, kind: str = "info") -> None:
             self.call_from_thread(self._append_status, message, kind)
 
         try:
-            answer = run_agent_loop(query, self._client, self._model, status_callback)
-            self.call_from_thread(self._show_answer, answer)
+            answer = run_agent_loop(query, self._client, self._model, status_callback, session_log=log)
+            log_path = log.save()
+            self.call_from_thread(self._show_answer, answer, log_path)
         except Exception as exc:
             self.call_from_thread(self._append_status, f"Error: {exc}", "error")
             self.call_from_thread(self._reenable_input)
@@ -433,9 +488,10 @@ class YtsearchApp(App):
         chat_log.mount(Static(f"[{markup}]{escape(message)}[/{markup}]", classes="status-message"))
         self._scroll_to_bottom()
 
-    def _show_answer(self, answer: str) -> None:
+    def _show_answer(self, answer: str, log_path) -> None:
         chat_log = self.query_one("#chat-log", VerticalScroll)
         chat_log.mount(Markdown(answer, classes="answer"))
+        chat_log.mount(Static(f"[dim]Session logged → {log_path}[/dim]", classes="status-message"))
         self._reenable_input()
         self._scroll_to_bottom()
 
