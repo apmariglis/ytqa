@@ -47,9 +47,13 @@ Or run without arguments to be prompted:
 uv run python ytsearch.py
 ```
 
-The agent searches YouTube with one or more refined queries, fetches transcripts for the most promising videos, and returns a Markdown answer with citations. Progress is shown in the TUI as it works — found videos, loaded transcripts (green), and skipped videos with no captions (yellow). Answers include `[M:SS]` timestamp citations so you can jump to the relevant moment. Press `Ctrl+Q` to exit.
+The agent runs in three phases:
 
-If Claude's selected videos lack captions, the agent automatically tries other discovered videos to reach at least 3 usable transcripts before synthesising.
+1. **Planning** — Claude receives your query and returns a set of YouTube search queries and transcript keywords via a structured tool call.
+2. **Search + fetch** — Each search query runs against YouTube (up to 10 results each). All discovered transcripts are fetched and cached locally.
+3. **Keyword matching + synthesis** — Transcript segments matching any keyword are extracted with surrounding context (`[M:SS]` timestamped excerpts). Videos with no matching segments are skipped. Claude synthesises the excerpts into a cited Markdown answer.
+
+Progress is shown in the TUI as it works — found videos, loaded transcripts (green), skipped videos with no captions (yellow). Answers include `[M:SS]` timestamp citations so you can jump to the relevant moment in each video. Press `Ctrl+Q` to exit.
 
 ## Session logs
 
@@ -63,11 +67,11 @@ Each log captures the full agent session in order:
 
 | Event | What it records |
 |-------|----------------|
-| `claude_search_response` | Claude's reasoning text and tool calls for each search turn |
+| `claude_planning_response` | Search queries and transcript keywords Claude chose |
 | `youtube_search` | Query used and every video result returned |
 | `youtube_search_error` | Query and error when yt-dlp fails |
-| `transcript_fetch` | Per-video outcome: `success`, `fallback`, `no_captions`, or `failed` |
-| `synthesis_input` | Which videos were used and the full transcript context given to Claude |
+| `transcript_fetch` | Per-video outcome: `success`, `no_captions`, or `failed` |
+| `synthesis_input` | Which videos had keyword matches and the full excerpt context given to Claude |
 | `synthesis_output` | The final answer verbatim |
 
 Every event has an ISO timestamp. Log files are self-contained for offline agent evaluation. The TUI shows the log path after each completed query.
@@ -77,7 +81,7 @@ Every event has an ISO timestamp. Log files are self-contained for offline agent
 - Videos must have captions/subtitles available.
 - If a video has multiple transcript tracks, you'll be prompted to choose one before the TUI launches (ytqa only).
 - `ytqa` responses are in the same language as the transcript.
-- Transcripts are cached in `transcripts/<video_id>.txt` and `transcripts/<video_id>.json` (with timestamps) — subsequent runs reuse the cached files.
+- Transcripts are cached in `transcripts/<video_id>.txt` and `transcripts/<video_id>.json` (with timestamps) — subsequent runs on the same or similar topics reuse cached files, making keyword matching fast.
 - `ytqa` shows running API cost in the header, updated after each call.
 - `logs/` and `transcripts/` are gitignored.
 
