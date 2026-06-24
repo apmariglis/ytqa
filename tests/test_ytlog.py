@@ -51,16 +51,16 @@ def test_session_log_started_at_is_set_on_construction():
     assert "T" in log.started_at  # ISO format: YYYY-MM-DDTHH:MM:SS
 
 
-def test_session_log_record_appends_event_with_correct_type():
-    log = SessionLog(query="q", model="m")
+def test_session_log_record_appends_event_with_correct_type(tmp_path):
+    log = SessionLog(query="q", model="m", logs_dir=tmp_path)
 
     log.record("youtube_search", query="python GIL")
 
     assert log.events[0]["type"] == "youtube_search"
 
 
-def test_session_log_record_includes_extra_kwargs_in_event():
-    log = SessionLog(query="q", model="m")
+def test_session_log_record_includes_extra_kwargs_in_event(tmp_path):
+    log = SessionLog(query="q", model="m", logs_dir=tmp_path)
 
     log.record("youtube_search", query="python GIL", result_count=5)
 
@@ -68,19 +68,47 @@ def test_session_log_record_includes_extra_kwargs_in_event():
     assert log.events[0]["result_count"] == 5
 
 
-def test_session_log_record_adds_timestamp_to_event():
-    log = SessionLog(query="q", model="m")
+def test_session_log_record_adds_timestamp_to_event(tmp_path):
+    log = SessionLog(query="q", model="m", logs_dir=tmp_path)
 
     log.record("youtube_search", query="x")
 
     assert "t" in log.events[0]
 
 
-def test_session_log_save_writes_valid_json_file(tmp_path):
-    log = SessionLog(query="python GIL", model="claude-opus")
+def test_session_log_record_persists_event_to_disk_immediately(tmp_path):
+    # Events must be written to disk as they are recorded so partial logs
+    # survive if the process is killed or crashes mid-run.
+    log = SessionLog(query="python GIL", model="claude-opus", logs_dir=tmp_path)
+
     log.record("youtube_search", query="python GIL")
 
-    path = log.save(tmp_path)
+    # File exists and contains the event without an explicit save() call.
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    assert len(data["events"]) == 1
+
+
+def test_session_log_record_updates_existing_file_on_each_call(tmp_path):
+    # Each subsequent record() call should overwrite the file with all events
+    # accumulated so far, not create a new file.
+    log = SessionLog(query="python GIL", model="claude-opus", logs_dir=tmp_path)
+
+    log.record("youtube_search", query="python GIL")
+    log.record("transcript_fetch", video_id="abc", title="Video", status="success")
+
+    files = list(tmp_path.iterdir())
+    assert len(files) == 1
+    data = json.loads(files[0].read_text(encoding="utf-8"))
+    assert len(data["events"]) == 2
+
+
+def test_session_log_save_writes_valid_json_file(tmp_path):
+    log = SessionLog(query="python GIL", model="claude-opus", logs_dir=tmp_path)
+    log.record("youtube_search", query="python GIL")
+
+    path = log.save()
 
     assert path.exists()
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -90,35 +118,35 @@ def test_session_log_save_writes_valid_json_file(tmp_path):
 
 
 def test_session_log_save_creates_logs_dir_if_absent(tmp_path):
-    log = SessionLog(query="q", model="m")
     logs_dir = tmp_path / "logs"
+    log = SessionLog(query="q", model="m", logs_dir=logs_dir)
 
-    log.save(logs_dir)
+    log.save()
 
     assert logs_dir.is_dir()
 
 
 def test_session_log_save_filename_contains_query_slug(tmp_path):
-    log = SessionLog(query="How does Python GIL work", model="m")
+    log = SessionLog(query="How does Python GIL work", model="m", logs_dir=tmp_path)
 
-    path = log.save(tmp_path)
+    path = log.save()
 
     assert "how-does-python-gil-work" in path.name
 
 
 def test_session_log_save_filename_contains_timestamp(tmp_path):
-    log = SessionLog(query="q", model="m")
+    log = SessionLog(query="q", model="m", logs_dir=tmp_path)
 
-    path = log.save(tmp_path)
+    path = log.save()
 
     # Timestamp portion must be in the name (year prefix is enough).
     assert log.started_at[:4] in path.name
 
 
 def test_session_log_save_returns_path_to_written_file(tmp_path):
-    log = SessionLog(query="q", model="m")
+    log = SessionLog(query="q", model="m", logs_dir=tmp_path)
 
-    path = log.save(tmp_path)
+    path = log.save()
 
     assert isinstance(path, Path)
     assert path.parent == tmp_path

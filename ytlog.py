@@ -4,12 +4,16 @@ Session logging for ytsearch agent runs.
 Each query produces one JSON log file capturing the full sequence of Claude
 API calls, YouTube searches, transcript fetches, and the final synthesis —
 enough detail to evaluate agent quality offline.
+
+Events are written to disk immediately after each record() call so partial
+logs survive if the process is killed or crashes mid-run.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -21,27 +25,33 @@ LOGS_DIR = Path("logs")
 class SessionLog:
     query: str
     model: str
+    logs_dir: Path = field(default_factory=lambda: LOGS_DIR)
     started_at: str = field(
         default_factory=lambda: datetime.now().isoformat(timespec="seconds")
     )
     events: list[dict] = field(default_factory=list)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False, compare=False
+    )
 
     def record(self, event_type: str, **data) -> None:
-        """Append a timestamped event to the log."""
-        self.events.append(
-            {
-                "type": event_type,
-                "t": datetime.now().isoformat(timespec="seconds"),
-                **data,
-            }
-        )
+        """Append a timestamped event and immediately persist to disk."""
+        with self._lock:
+            self.events.append(
+                {
+                    "type": event_type,
+                    "t": datetime.now().isoformat(timespec="seconds"),
+                    **data,
+                }
+            )
+            self.save()
 
-    def save(self, logs_dir: Path = LOGS_DIR) -> Path:
+    def save(self) -> Path:
         """Write the log to <logs_dir>/<timestamp>_<slug>.json and return the path."""
-        logs_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
         slug = re.sub(r"[^\w]+", "-", self.query[:50]).strip("-").lower()
         ts = self.started_at.replace(":", "-")
-        path = logs_dir / f"{ts}_{slug}.json"
+        path = self.logs_dir / f"{ts}_{slug}.json"
         path.write_text(
             json.dumps(
                 {

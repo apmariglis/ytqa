@@ -51,9 +51,16 @@ def fetch_video_title(video_id: str) -> str:
     return video_id
 
 
-def pick_transcript(available: list) -> object:
+def pick_transcript(available: list, auto: bool = False) -> object:
     if len(available) == 1:
         return available[0]
+
+    if auto:
+        # Prefer manual transcripts (non-generated), then English, then first.
+        manual = [t for t in available if not t.is_generated]
+        pool = manual if manual else available
+        english = [t for t in pool if t.language_code.startswith("en")]
+        return english[0] if english else pool[0]
 
     print("\nMultiple transcripts available:")
     for i, t in enumerate(available):
@@ -71,11 +78,11 @@ def _seconds_to_timestamp(seconds: float) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
-def fetch_and_save_transcript(video_id: str) -> str:
+def fetch_and_save_transcript(video_id: str, auto: bool = False) -> str:
     api = YouTubeTranscriptApi()
     transcript_list = api.list(video_id)
     available = list(transcript_list)
-    chosen = pick_transcript(available)
+    chosen = pick_transcript(available, auto=auto)
     fetched = chosen.fetch()
 
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
@@ -109,10 +116,14 @@ def format_transcript_with_timestamps(segments: list[dict]) -> str:
     )
 
 
-def load_transcript(video_id: str) -> tuple[str, bool]:
-    """Return (transcript_text, from_cache)."""
+def load_transcript(video_id: str, auto: bool = False) -> tuple[str, bool]:
+    """Return (transcript_text, from_cache).
+
+    When auto=True, multiple transcript tracks are selected automatically
+    (manual > English > first) without prompting the user.
+    """
     transcript_path = TRANSCRIPTS_DIR / f"{video_id}.txt"
     if transcript_path.exists():
         return transcript_path.read_text(encoding="utf-8"), True
 
-    return fetch_and_save_transcript(video_id), False
+    return fetch_and_save_transcript(video_id, auto=auto), False

@@ -395,7 +395,7 @@ def run_agent_loop(
         if status_callback:
             status_callback(f"Fetching transcript: {title}…", "info")
         try:
-            text, _ = load_transcript(video_id)
+            text, _ = load_transcript(video_id, auto=True)
             segs = load_transcript_segments(video_id)
             if segs:
                 with _segments_lock:

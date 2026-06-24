@@ -83,7 +83,7 @@ def test_returns_from_cache_false_when_transcript_must_be_fetched(tmp_path, monk
     # No cached file exists — fetch_and_save_transcript is called instead.
     monkeypatch.setattr(ytlib, "TRANSCRIPTS_DIR", tmp_path)
     monkeypatch.setattr(
-        ytlib, "fetch_and_save_transcript", lambda _video_id: CACHED_TRANSCRIPT_TEXT
+        ytlib, "fetch_and_save_transcript", lambda _video_id, auto=False: CACHED_TRANSCRIPT_TEXT
     )
 
     _text, from_cache = load_transcript("uncached_video_id")

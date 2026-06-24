@@ -740,7 +740,7 @@ def test_run_agent_loop_fetches_transcripts_for_all_discovered_videos(mocker):
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
 
-    mock_load.assert_called_once_with(SELECTED_VIDEO_ID)
+    mock_load.assert_called_once_with(SELECTED_VIDEO_ID, auto=True)
 
 
 def test_run_agent_loop_includes_keyword_matched_excerpts_in_synthesis_prompt(mocker):
@@ -1056,7 +1056,7 @@ def test_main_prompts_for_query_via_input_when_no_argument_given(mocker):
 # Group L — run_agent_loop() session logging integration
 # ===========================================================================
 
-def test_run_agent_loop_records_claude_planning_response_in_session_log(mocker):
+def test_run_agent_loop_records_claude_planning_response_in_session_log(mocker, tmp_path):
     # The planning call result must be captured to review what search strategy
     # and keywords Claude chose — essential for evaluating agent quality.
     mocker.patch("ytsearch.search_youtube", return_value=[])
@@ -1064,7 +1064,7 @@ def test_run_agent_loop_records_claude_planning_response_in_session_log(mocker):
         _plan_response(["python GIL"], ["GIL"]),
         _make_synthesis_response("No results."),
     )
-    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL, logs_dir=tmp_path)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
 
@@ -1074,7 +1074,7 @@ def test_run_agent_loop_records_claude_planning_response_in_session_log(mocker):
     assert "transcript_keywords" in planning_events[0]
 
 
-def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(mocker):
+def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(mocker, tmp_path):
     # Recording the query and results makes it possible to judge whether
     # Claude chose good search terms.
     search_result = VideoResult(
@@ -1088,7 +1088,7 @@ def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(
         _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
-    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL, logs_dir=tmp_path)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
 
@@ -1098,10 +1098,10 @@ def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(
     assert any(r["video_id"] == SELECTED_VIDEO_ID for r in search_events[0]["results"])
 
 
-def test_run_agent_loop_records_transcript_fetch_success_in_session_log(mocker):
+def test_run_agent_loop_records_transcript_fetch_success_in_session_log(mocker, tmp_path):
     # Success events show which videos actually contributed to the answer.
     client, _ = _setup_synthesis_scenario(mocker)
-    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL, logs_dir=tmp_path)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
 
@@ -1110,7 +1110,7 @@ def test_run_agent_loop_records_transcript_fetch_success_in_session_log(mocker):
     assert any(e["video_id"] == SELECTED_VIDEO_ID for e in fetch_events)
 
 
-def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker):
+def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker, tmp_path):
     # No-captions events explain gaps in the final answer during review.
     from youtube_transcript_api import CouldNotRetrieveTranscript
 
@@ -1124,7 +1124,7 @@ def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker):
         _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
-    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL, logs_dir=tmp_path)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
 
@@ -1132,11 +1132,11 @@ def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker):
     assert any(e["status"] == "no_captions" for e in fetch_events)
 
 
-def test_run_agent_loop_records_synthesis_input_with_excerpt_context(mocker):
+def test_run_agent_loop_records_synthesis_input_with_excerpt_context(mocker, tmp_path):
     # The excerpt context passed to synthesis must be logged so reviewers
     # can judge whether Claude had enough relevant content.
     client, _ = _setup_synthesis_scenario(mocker)
-    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL, logs_dir=tmp_path)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
 
@@ -1146,11 +1146,11 @@ def test_run_agent_loop_records_synthesis_input_with_excerpt_context(mocker):
     assert "Today we talk about the GIL" in synthesis_input_events[0]["transcript_context"]
 
 
-def test_run_agent_loop_records_synthesis_output_answer_in_session_log(mocker):
+def test_run_agent_loop_records_synthesis_output_answer_in_session_log(mocker, tmp_path):
     # The final answer is stored verbatim so logs are self-contained for
     # offline evaluation without re-running the agent.
     client, _ = _setup_synthesis_scenario(mocker)
-    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
+    log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL, logs_dir=tmp_path)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
 
