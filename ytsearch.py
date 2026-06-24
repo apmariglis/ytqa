@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import yt_dlp
@@ -53,6 +55,8 @@ excerpts allow, and state any gaps plainly within the answer itself.\
 
 SYNTHESIS_MAX_TOKENS = 4096
 SEARCH_MAX_RESULTS = 10
+MAX_POOL_SIZE = 20          # max unique videos to fetch transcripts for
+MAX_CONCURRENT_FETCHES = 5  # parallel transcript fetches
 DEFAULT_WINDOW_SIZE = 3
 
 # Maps status kind → Rich markup tag used in the TUI.
@@ -376,11 +380,16 @@ def run_agent_loop(
             if status_callback:
                 status_callback(f'Search failed: "{query}"', "error")
 
+    # Cap pool size to avoid fetching hundreds of transcripts.
+    if len(all_video_results) > MAX_POOL_SIZE:
+        all_video_results = dict(list(all_video_results.items())[:MAX_POOL_SIZE])
+
     # --- Phase 3: Fetching transcripts ---
     if status_callback:
         status_callback(f"Fetching transcripts ({len(all_video_results)} video{'s' if len(all_video_results) != 1 else ''})", "phase")
 
     segments_by_id: dict[str, list[dict]] = {}
+    _segments_lock = threading.Lock()
 
     def _fetch_one(video_id: str, title: str) -> None:
         if status_callback:
@@ -389,7 +398,8 @@ def run_agent_loop(
             text, _ = load_transcript(video_id)
             segs = load_transcript_segments(video_id)
             if segs:
-                segments_by_id[video_id] = segs
+                with _segments_lock:
+                    segments_by_id[video_id] = segs
             if status_callback:
                 status_callback(f"Loaded: {title}", "success")
             if session_log:
@@ -421,8 +431,13 @@ def run_agent_loop(
                     error=str(exc),
                 )
 
-    for video_id, video in all_video_results.items():
-        _fetch_one(video_id, video.title)
+    with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_FETCHES) as executor:
+        futures = {
+            executor.submit(_fetch_one, vid_id, vid.title): vid_id
+            for vid_id, vid in all_video_results.items()
+        }
+        for future in as_completed(futures):
+            future.result()  # exceptions are handled inside _fetch_one
 
     # --- Phase 4: Keyword matching ---
     if status_callback:
