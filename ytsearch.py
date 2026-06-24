@@ -62,6 +62,7 @@ _STATUS_MARKUP: dict[str, str] = {
     "success": "green",
     "skip": "yellow",
     "error": "red",
+    "phase": "bold",
 }
 
 CSS = """
@@ -310,9 +311,9 @@ def run_agent_loop(
     session_log: SessionLog | None = None,
     window_size: int = DEFAULT_WINDOW_SIZE,
 ) -> str:
-    # --- Phase 1: Planning call ---
+    # --- Phase 1: Planning ---
     if status_callback:
-        status_callback("Planning research strategy…", "info")
+        status_callback("Planning", "phase")
 
     plan_response = _create_with_retry(
         client,
@@ -338,7 +339,15 @@ def run_agent_loop(
             transcript_keywords=transcript_keywords,
         )
 
-    # --- Phase 2: Search YouTube for each query ---
+    if status_callback:
+        for q in search_queries:
+            status_callback(f'Search query: "{q}"', "info")
+        status_callback(f"Keywords: {', '.join(transcript_keywords)}", "info")
+
+    # --- Phase 2: Searching YouTube ---
+    if status_callback:
+        status_callback(f"Searching YouTube ({len(search_queries)} quer{'y' if len(search_queries) == 1 else 'ies'})", "phase")
+
     all_video_results: dict[str, VideoResult] = {}
 
     for query in search_queries:
@@ -367,7 +376,10 @@ def run_agent_loop(
             if status_callback:
                 status_callback(f'Search failed: "{query}"', "error")
 
-    # --- Phase 3: Fetch all transcripts ---
+    # --- Phase 3: Fetching transcripts ---
+    if status_callback:
+        status_callback(f"Fetching transcripts ({len(all_video_results)} video{'s' if len(all_video_results) != 1 else ''})", "phase")
+
     segments_by_id: dict[str, list[dict]] = {}
 
     def _fetch_one(video_id: str, title: str) -> None:
@@ -412,17 +424,25 @@ def run_agent_loop(
     for video_id, video in all_video_results.items():
         _fetch_one(video_id, video.title)
 
-    # --- Phase 4: Local keyword matching ---
+    # --- Phase 4: Keyword matching ---
+    if status_callback:
+        status_callback("Matching keywords in transcripts", "phase")
+
     video_excerpts = build_video_excerpts(
         all_video_results, segments_by_id, transcript_keywords, window_size
     )
 
     if status_callback:
-        status_callback(
-            f"Found relevant content in {len(video_excerpts)} video(s)…", "info"
-        )
+        for video_id, video in all_video_results.items():
+            if video_id in video_excerpts:
+                n = len(video_excerpts[video_id]["excerpts"])
+                status_callback(f"Matched: {video.title} ({n} excerpt{'s' if n != 1 else ''})", "success")
+            elif video_id in segments_by_id:
+                status_callback(f"No matches: {video.title}", "skip")
 
-    # --- Phase 5: Synthesis ---
+    # --- Phase 5: Synthesising ---
+    if status_callback:
+        status_callback("Synthesising answer", "phase")
     transcript_sections = []
     for video_id, data in video_excerpts.items():
         excerpts_text = "\n".join(_format_excerpt_window(w) for w in data["excerpts"])
