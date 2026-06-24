@@ -540,7 +540,9 @@ class YtsearchApp(App):
             log_path = log.save()
             self.call_from_thread(self._show_answer, answer, log_path)
         except Exception as exc:
+            log_path = log.save()
             self.call_from_thread(self._append_status, f"Error: {exc}", "error")
+            self.call_from_thread(self._append_status, f"Session logged → {log_path}", "info")
             self.call_from_thread(self._reenable_input)
 
     def _append_status(self, message: str, kind: str = "info") -> None:
