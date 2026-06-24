@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 import time
 from dataclasses import dataclass
@@ -20,40 +19,41 @@ from textual.markup import escape
 from ytlib import (
     load_transcript,
     load_transcript_segments,
-    format_transcript_with_timestamps,
     MAX_TOKENS,
 )
 from ytlog import SessionLog, serialize_content
 
 load_dotenv()
 
-SEARCH_SYSTEM_PROMPT = """\
-You are a YouTube research assistant. Use the youtube_search tool to find videos relevant \
-to the user's query. You may search multiple times with different or refined queries to \
-find the best results.
-
-When you have identified the 1–3 most promising videos, finish your response with this \
-exact block (no extra text after it):
-<selected_videos>["video_id_1", "video_id_2"]</selected_videos>\
+PLANNING_SYSTEM_PROMPT = """\
+You are a YouTube research assistant. Given a user's query, plan a research session \
+by calling the plan_search tool with:
+1. A list of YouTube search queries (2–5 queries) to find relevant videos — vary the phrasing \
+and include synonyms so the searches complement each other.
+2. A list of keywords and short phrases (5–10) that would appear in the transcript text of a \
+video that genuinely answers the query — include technical terms, synonyms, and related concepts.\
 """
 
 SYNTHESIS_SYSTEM_PROMPT = """\
-You are a YouTube research assistant. Using the transcript excerpts provided, write a \
+You are a YouTube research assistant. Using the relevant transcript excerpts provided, write a \
 comprehensive answer to the user's query in Markdown.
 
-Transcripts include [M:SS] timestamps. Cite specific claims with the source video and the \
-nearest timestamp using this format: ([Video Title](URL) ~M:SS)
+Excerpts include [M:SS] timestamps indicating where in the video the content appears. Cite \
+specific claims with the source video and the nearest timestamp using this format: \
+([Video Title](URL) ~M:SS)
 
 For example: "The GIL prevents true parallelism ([Understanding the GIL](https://...) ~2:15)"
 
-If a transcript has no timestamps, cite with just the title and URL.
+If an excerpt has no timestamp, cite with just the title and URL.
 
-Base your entire answer on the provided transcripts. Do not suggest the user seek \
+Base your entire answer on the provided excerpts. Do not suggest the user seek \
 "additional sources" or "further research" — give the most complete answer the available \
-transcripts allow, and state any gaps plainly within the answer itself.\
+excerpts allow, and state any gaps plainly within the answer itself.\
 """
 
 SYNTHESIS_MAX_TOKENS = 4096
+SEARCH_MAX_RESULTS = 10
+DEFAULT_WINDOW_SIZE = 3
 
 # Maps status kind → Rich markup tag used in the TUI.
 _STATUS_MARKUP: dict[str, str] = {
@@ -145,7 +145,7 @@ class VideoResult:
     duration_seconds: int | None
 
 
-def search_youtube(query: str, max_results: int = 5) -> list[VideoResult]:
+def search_youtube(query: str, max_results: int = SEARCH_MAX_RESULTS) -> list[VideoResult]:
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
@@ -179,26 +179,31 @@ def search_youtube(query: str, max_results: int = 5) -> list[VideoResult]:
     return results
 
 
-def build_search_tool_definition() -> dict:
+def build_plan_tool_definition() -> dict:
     return {
-        "name": "youtube_search",
+        "name": "plan_search",
         "description": (
-            "Search YouTube for videos matching a query. "
-            "Returns video IDs, titles, URLs, and descriptions."
+            "Plan a YouTube research session by specifying search queries and "
+            "keywords to locate in video transcripts."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to find relevant YouTube videos.",
+                "search_queries": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "YouTube search queries to find relevant videos.",
                 },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return (default: 5).",
+                "transcript_keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Keywords and short phrases to search for in video transcripts. "
+                        "Include technical terms, synonyms, and related concepts."
+                    ),
                 },
             },
-            "required": ["query"],
+            "required": ["search_queries", "transcript_keywords"],
         },
     }
 
@@ -218,14 +223,83 @@ def fetch_transcripts_for_videos(video_ids: list[str]) -> dict[str, str]:
     return transcripts
 
 
-def _parse_selected_video_ids(text: str) -> list[str]:
-    match = re.search(r"<selected_videos>(\[.*?\])</selected_videos>", text, re.DOTALL)
-    if not match:
+def extract_keyword_windows(
+    segments: list[dict],
+    keywords: list[str],
+    window_size: int = DEFAULT_WINDOW_SIZE,
+) -> list[dict]:
+    """
+    Find segments matching any keyword and return merged windows of surrounding context.
+    Each returned window is {"start": float, "text": str}.
+    Matching is case-insensitive substring search.
+    """
+    if not segments or not keywords:
         return []
-    try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError:
+
+    keywords_lower = [kw.lower() for kw in keywords]
+
+    matched_indices = set()
+    for i, seg in enumerate(segments):
+        text_lower = seg["text"].lower()
+        if any(kw in text_lower for kw in keywords_lower):
+            matched_indices.add(i)
+
+    if not matched_indices:
         return []
+
+    # Expand each match to a window range
+    ranges = []
+    for idx in sorted(matched_indices):
+        start = max(0, idx - window_size)
+        end = min(len(segments) - 1, idx + window_size)
+        ranges.append([start, end])
+
+    # Merge overlapping ranges (not merely adjacent — adjacent windows have no
+    # shared context so they should stay separate).
+    merged = [ranges[0]]
+    for start, end in ranges[1:]:
+        if start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    result = []
+    for start, end in merged:
+        window_segs = segments[start:end + 1]
+        text = " ".join(seg["text"] for seg in window_segs)
+        result.append({"start": window_segs[0]["start"], "text": text})
+
+    return result
+
+
+def build_video_excerpts(
+    all_video_results: dict[str, VideoResult],
+    segments_by_id: dict[str, list[dict]],
+    keywords: list[str],
+    window_size: int = DEFAULT_WINDOW_SIZE,
+) -> dict[str, dict]:
+    """
+    Build {video_id → {title, url, excerpts}} for every video where at least
+    one keyword matches a transcript segment. Videos with no matches are omitted.
+    """
+    result = {}
+    for video_id, segments in segments_by_id.items():
+        windows = extract_keyword_windows(segments, keywords, window_size)
+        if not windows:
+            continue
+        video = all_video_results.get(video_id)
+        result[video_id] = {
+            "title": video.title if video else video_id,
+            "url": video.url if video else f"https://www.youtube.com/watch?v={video_id}",
+            "excerpts": windows,
+        }
+    return result
+
+
+def _format_excerpt_window(window: dict) -> str:
+    total = int(window["start"])
+    ts = f"{total // 60}:{total % 60:02d}"
+    return f"[{ts}] {window['text']}"
 
 
 def run_agent_loop(
@@ -234,118 +308,76 @@ def run_agent_loop(
     model: str,
     status_callback=None,
     session_log: SessionLog | None = None,
+    window_size: int = DEFAULT_WINDOW_SIZE,
 ) -> str:
-    messages = [{"role": "user", "content": user_query}]
-    tools = [build_search_tool_definition()]
-    all_video_results: dict[str, VideoResult] = {}
-
+    # --- Phase 1: Planning call ---
     if status_callback:
-        status_callback(f'Searching YouTube for "{user_query}"…', "info")
+        status_callback("Planning research strategy…", "info")
 
-    # --- Phase 1: search loop ---
-    search_end_text = ""
-    while True:
-        response = _create_with_retry(
-            client,
-            status_callback,
-            model=model,
-            max_tokens=MAX_TOKENS,
-            system=SEARCH_SYSTEM_PROMPT,
-            tools=tools,
-            messages=messages,
+    plan_response = _create_with_retry(
+        client,
+        status_callback,
+        model=model,
+        max_tokens=MAX_TOKENS,
+        system=PLANNING_SYSTEM_PROMPT,
+        tools=[build_plan_tool_definition()],
+        messages=[{"role": "user", "content": user_query}],
+    )
+
+    search_queries: list[str] = []
+    transcript_keywords: list[str] = []
+    for block in plan_response.content:
+        if getattr(block, "type", None) == "tool_use" and block.name == "plan_search":
+            search_queries = block.input.get("search_queries", [])
+            transcript_keywords = block.input.get("transcript_keywords", [])
+
+    if session_log:
+        session_log.record(
+            "claude_planning_response",
+            search_queries=search_queries,
+            transcript_keywords=transcript_keywords,
         )
 
-        messages.append({"role": "assistant", "content": response.content})
+    # --- Phase 2: Search YouTube for each query ---
+    all_video_results: dict[str, VideoResult] = {}
 
-        if session_log:
-            session_log.record(
-                "claude_search_response",
-                stop_reason=response.stop_reason,
-                content=serialize_content(response.content),
-            )
-
-        if response.stop_reason == "end_turn":
-            for block in response.content:
-                if hasattr(block, "text"):
-                    search_end_text = block.text
-            break
-
-        # Process tool_use blocks and build tool_result reply
-        tool_results = []
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-
-            query = block.input.get("query", "")
-            max_results = block.input.get("max_results", 5)
-
-            if status_callback:
-                status_callback(f'Searching YouTube for "{query}"…', "info")
-
-            try:
-                results = search_youtube(query, max_results)
-                for r in results:
-                    all_video_results[r.video_id] = r
-
-                if status_callback:
-                    for r in results:
-                        status_callback(f'Found: "{r.title}" — {r.url}', "found")
-
-                if session_log:
-                    session_log.record(
-                        "youtube_search",
-                        query=query,
-                        results=[
-                            {"video_id": r.video_id, "title": r.title, "url": r.url}
-                            for r in results
-                        ],
-                    )
-
-                results_data = [
-                    {
-                        "video_id": r.video_id,
-                        "title": r.title,
-                        "url": r.url,
-                        "description": r.description,
-                        "view_count": r.view_count,
-                    }
-                    for r in results
-                ]
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(results_data),
-                    }
-                )
-            except SearchError as exc:
-                if session_log:
-                    session_log.record("youtube_search_error", query=query, error=str(exc))
-                tool_results.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": f"Search failed: {exc}",
-                        "is_error": True,
-                    }
-                )
-
-        if tool_results:
-            messages.append({"role": "user", "content": tool_results})
-
-    # --- Phase 2: fetch transcripts and synthesize ---
-    selected_ids = _parse_selected_video_ids(search_end_text)
-
-    # Fetch each transcript individually so we can report progress per video.
-    transcripts: dict[str, str] = {}
-
-    def _fetch_one(video_id: str, title: str, is_fallback: bool = False) -> None:
+    for query in search_queries:
         if status_callback:
-            label = f"Trying alternative: {title}…" if is_fallback else f"Fetching transcript: {title}…"
-            status_callback(label, "info")
+            status_callback(f'Searching: "{query}"…', "info")
+        try:
+            results = search_youtube(query, SEARCH_MAX_RESULTS)
+            for r in results:
+                is_new = r.video_id not in all_video_results
+                all_video_results[r.video_id] = r
+                if is_new and status_callback:
+                    status_callback(f'Found: "{r.title}" — {r.url}', "found")
+
+            if session_log:
+                session_log.record(
+                    "youtube_search",
+                    query=query,
+                    results=[
+                        {"video_id": r.video_id, "title": r.title, "url": r.url}
+                        for r in results
+                    ],
+                )
+        except SearchError as exc:
+            if session_log:
+                session_log.record("youtube_search_error", query=query, error=str(exc))
+            if status_callback:
+                status_callback(f'Search failed: "{query}"', "error")
+
+    # --- Phase 3: Fetch all transcripts ---
+    segments_by_id: dict[str, list[dict]] = {}
+
+    def _fetch_one(video_id: str, title: str) -> None:
+        if status_callback:
+            status_callback(f"Fetching transcript: {title}…", "info")
         try:
             text, _ = load_transcript(video_id)
-            transcripts[video_id] = text
+            segs = load_transcript_segments(video_id)
+            if segs:
+                segments_by_id[video_id] = segs
             if status_callback:
                 status_callback(f"Loaded: {title}", "success")
             if session_log:
@@ -353,10 +385,10 @@ def run_agent_loop(
                     "transcript_fetch",
                     video_id=video_id,
                     title=title,
-                    status="fallback" if is_fallback else "success",
+                    status="success",
                 )
         except CouldNotRetrieveTranscript:
-            if status_callback and not is_fallback:
+            if status_callback:
                 status_callback(f"No captions: {title}", "skip")
             if session_log:
                 session_log.record(
@@ -366,7 +398,7 @@ def run_agent_loop(
                     status="no_captions",
                 )
         except Exception as exc:
-            if status_callback and not is_fallback:
+            if status_callback:
                 status_callback(f"Failed: {title}", "error")
             if session_log:
                 session_log.record(
@@ -377,52 +409,35 @@ def run_agent_loop(
                     error=str(exc),
                 )
 
-    for video_id in selected_ids:
-        video = all_video_results.get(video_id)
-        _fetch_one(video_id, video.title if video else video_id)
+    for video_id, video in all_video_results.items():
+        _fetch_one(video_id, video.title)
 
-    # If fewer than 3 transcripts loaded, try other discovered videos as fallbacks.
-    TARGET_TRANSCRIPT_COUNT = 3
-    if len(transcripts) < TARGET_TRANSCRIPT_COUNT:
-        fallback_ids = [
-            vid_id for vid_id in all_video_results
-            if vid_id not in selected_ids and vid_id not in transcripts
-        ]
-        for video_id in fallback_ids:
-            if len(transcripts) >= TARGET_TRANSCRIPT_COUNT:
-                break
-            video = all_video_results[video_id]
-            _fetch_one(video_id, video.title, is_fallback=True)
+    # --- Phase 4: Local keyword matching ---
+    video_excerpts = build_video_excerpts(
+        all_video_results, segments_by_id, transcript_keywords, window_size
+    )
 
+    if status_callback:
+        status_callback(
+            f"Found relevant content in {len(video_excerpts)} video(s)…", "info"
+        )
+
+    # --- Phase 5: Synthesis ---
     transcript_sections = []
-    for video_id, text in transcripts.items():
-        video = all_video_results.get(video_id)
-
-        # Use timestamped segments when available so Claude can cite timestamps.
-        segments = load_transcript_segments(video_id)
-        if segments:
-            transcript_content = format_transcript_with_timestamps(segments)[:12000]
-        else:
-            transcript_content = text[:8000]
-
-        if video:
-            transcript_sections.append(
-                f"## {video.title}\nURL: {video.url}\n\nTranscript:\n{transcript_content}"
-            )
-        else:
-            transcript_sections.append(
-                f"## Video {video_id}\n\nTranscript:\n{transcript_content}"
-            )
+    for video_id, data in video_excerpts.items():
+        excerpts_text = "\n".join(_format_excerpt_window(w) for w in data["excerpts"])
+        transcript_sections.append(
+            f"## {data['title']}\nURL: {data['url']}\n\nRelevant excerpts:\n{excerpts_text}"
+        )
 
     transcript_context = "\n\n---\n\n".join(transcript_sections)
 
     if session_log:
         session_log.record(
             "synthesis_input",
-            selected_ids=selected_ids,
-            transcripts_loaded=[
-                {"video_id": vid, "title": all_video_results[vid].title if vid in all_video_results else vid}
-                for vid in transcripts
+            videos_with_excerpts=[
+                {"video_id": vid, "title": data["title"]}
+                for vid, data in video_excerpts.items()
             ],
             transcript_context=transcript_context,
         )
@@ -432,7 +447,7 @@ def run_agent_loop(
             "role": "user",
             "content": (
                 f"User query: {user_query}\n\n"
-                f"Here are the relevant video transcripts:\n\n{transcript_context}\n\n"
+                f"Here are relevant excerpts from video transcripts:\n\n{transcript_context}\n\n"
                 "Please provide a comprehensive answer with citations."
             ),
         }

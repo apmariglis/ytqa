@@ -4,9 +4,11 @@ Tests for ytsearch.py.
 Group A  — VideoResult dataclass
 Group B  — search_youtube() normal results
 Group C  — search_youtube() error handling
-Group D  — build_search_tool_definition()
 Group E  — fetch_transcripts_for_videos()
-Group F  — run_agent_loop() search phase
+Group N  — build_plan_tool_definition()
+Group O  — extract_keyword_windows()
+Group P  — build_video_excerpts()
+Group F  — run_agent_loop() planning phase
 Group G  — run_agent_loop() synthesis phase
 Group L  — run_agent_loop() session logging integration
 Group M  — _create_with_retry() transient error handling
@@ -26,7 +28,9 @@ import ytsearch
 from ytsearch import (
     VideoResult,
     SearchError,
-    build_search_tool_definition,
+    build_plan_tool_definition,
+    extract_keyword_windows,
+    build_video_excerpts,
     fetch_transcripts_for_videos,
     run_agent_loop,
     search_youtube,
@@ -58,19 +62,34 @@ class FakeResponse:
     content: list
 
 
-def _end_turn_response(text: str) -> FakeResponse:
-    return FakeResponse(stop_reason="end_turn", content=[FakeTextBlock(text=text)])
-
-
-def _tool_use_response(tool_id: str, tool_input: dict) -> FakeResponse:
-    return FakeResponse(
-        stop_reason="tool_use",
-        content=[FakeToolUseBlock(id=tool_id, name="youtube_search", input=tool_input)],
-    )
-
-
 def _make_synthesis_response(answer_text: str) -> FakeResponse:
     return FakeResponse(stop_reason="end_turn", content=[FakeTextBlock(text=answer_text)])
+
+
+# ---------------------------------------------------------------------------
+# Helpers — planning response factory
+# ---------------------------------------------------------------------------
+
+PLAN_TOOL_USE_ID = "tu_plan_123"
+PLAN_SEARCH_QUERIES = ["Python GIL explained", "python global interpreter lock"]
+PLAN_KEYWORDS = ["GIL", "global interpreter lock", "mutex"]
+
+
+def _plan_response(
+    search_queries: list[str] | None = None,
+    transcript_keywords: list[str] | None = None,
+) -> FakeResponse:
+    return FakeResponse(
+        stop_reason="tool_use",
+        content=[FakeToolUseBlock(
+            id=PLAN_TOOL_USE_ID,
+            name="plan_search",
+            input={
+                "search_queries": search_queries if search_queries is not None else PLAN_SEARCH_QUERIES,
+                "transcript_keywords": transcript_keywords if transcript_keywords is not None else PLAN_KEYWORDS,
+            },
+        )],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,40 +262,6 @@ def test_search_youtube_returns_empty_list_when_yt_dlp_entries_key_is_none(mocke
 
 
 # ===========================================================================
-# Group D — build_search_tool_definition()
-# ===========================================================================
-
-def test_build_search_tool_definition_returns_dict_with_name_youtube_search():
-    tool = build_search_tool_definition()
-
-    assert tool["name"] == "youtube_search"
-
-
-def test_build_search_tool_definition_includes_query_parameter_in_input_schema():
-    tool = build_search_tool_definition()
-
-    assert "query" in tool["input_schema"]["properties"]
-
-
-def test_build_search_tool_definition_marks_query_parameter_as_required():
-    tool = build_search_tool_definition()
-
-    assert "query" in tool["input_schema"]["required"]
-
-
-def test_build_search_tool_definition_includes_optional_max_results_parameter():
-    tool = build_search_tool_definition()
-
-    assert "max_results" in tool["input_schema"]["properties"]
-
-
-def test_build_search_tool_definition_specifies_max_results_as_integer_type():
-    tool = build_search_tool_definition()
-
-    assert tool["input_schema"]["properties"]["max_results"]["type"] == "integer"
-
-
-# ===========================================================================
 # Group E — fetch_transcripts_for_videos()
 # ===========================================================================
 
@@ -325,12 +310,301 @@ def test_fetch_transcripts_for_videos_returns_empty_dict_for_empty_input(mocker)
 
 
 # ===========================================================================
-# Group F — run_agent_loop() search phase
+# Group N — build_plan_tool_definition()
+# ===========================================================================
+
+def test_build_plan_tool_definition_returns_dict_with_name_plan_search():
+    tool = build_plan_tool_definition()
+
+    assert tool["name"] == "plan_search"
+
+
+def test_build_plan_tool_definition_includes_search_queries_array_in_schema():
+    tool = build_plan_tool_definition()
+
+    prop = tool["input_schema"]["properties"]["search_queries"]
+    assert prop["type"] == "array"
+
+
+def test_build_plan_tool_definition_includes_transcript_keywords_array_in_schema():
+    tool = build_plan_tool_definition()
+
+    prop = tool["input_schema"]["properties"]["transcript_keywords"]
+    assert prop["type"] == "array"
+
+
+def test_build_plan_tool_definition_marks_search_queries_as_required():
+    tool = build_plan_tool_definition()
+
+    assert "search_queries" in tool["input_schema"]["required"]
+
+
+def test_build_plan_tool_definition_marks_transcript_keywords_as_required():
+    tool = build_plan_tool_definition()
+
+    assert "transcript_keywords" in tool["input_schema"]["required"]
+
+
+# ===========================================================================
+# Group O — extract_keyword_windows()
+# ===========================================================================
+
+# Segments used across multiple window tests.
+_SEGMENTS = [
+    {"start": 0.0,   "text": "Welcome to this video."},
+    {"start": 5.0,   "text": "Today we discuss the GIL."},
+    {"start": 10.0,  "text": "It is a mutex protecting Python objects."},
+    {"start": 15.0,  "text": "This prevents true parallelism."},
+    {"start": 20.0,  "text": "Thanks for watching."},
+]
+
+
+def test_extract_keyword_windows_returns_empty_list_when_no_keywords_match():
+    # No segment contains "asyncio" so no windows should be returned.
+    result = extract_keyword_windows(_SEGMENTS, ["asyncio"])
+
+    assert result == []
+
+
+def test_extract_keyword_windows_returns_empty_list_for_empty_segments():
+    result = extract_keyword_windows([], ["GIL"])
+
+    assert result == []
+
+
+def test_extract_keyword_windows_returns_empty_list_for_empty_keywords():
+    result = extract_keyword_windows(_SEGMENTS, [])
+
+    assert result == []
+
+
+def test_extract_keyword_windows_returns_window_containing_matched_segment():
+    # "GIL" appears in segment index 1; the window should include that text.
+    result = extract_keyword_windows(_SEGMENTS, ["GIL"], window_size=1)
+
+    combined = " ".join(w["text"] for w in result)
+    assert "GIL" in combined
+
+
+def test_extract_keyword_windows_clamps_window_at_start_of_transcript():
+    # Segment 0 matches; window cannot extend before the beginning.
+    segments = [
+        {"start": 0.0, "text": "The GIL is important."},
+        {"start": 5.0, "text": "It protects objects."},
+        {"start": 10.0, "text": "True parallelism is blocked."},
+    ]
+
+    result = extract_keyword_windows(segments, ["GIL"], window_size=3)
+
+    # Start index must be 0, not negative.
+    assert result[0]["start"] == 0.0
+
+
+def test_extract_keyword_windows_clamps_window_at_end_of_transcript():
+    # Last segment matches; window cannot extend beyond the end.
+    segments = [
+        {"start": 0.0,  "text": "Introduction."},
+        {"start": 5.0,  "text": "More content."},
+        {"start": 10.0, "text": "The GIL is a mutex."},
+    ]
+
+    result = extract_keyword_windows(segments, ["mutex"], window_size=5)
+
+    # Should not raise and should include the last segment's text.
+    combined = " ".join(w["text"] for w in result)
+    assert "mutex" in combined
+
+
+def test_extract_keyword_windows_matches_case_insensitively():
+    # Keyword "gil" in lowercase should match "GIL" in the segment text.
+    result = extract_keyword_windows(_SEGMENTS, ["gil"])
+
+    assert len(result) > 0
+
+
+def test_extract_keyword_windows_merges_overlapping_windows():
+    # Segments 1 and 2 both match; with window_size=1 their windows overlap
+    # (indices 0–2 and 1–3) and should merge into a single excerpt.
+    segments = [
+        {"start": 0.0,  "text": "Introduction."},
+        {"start": 5.0,  "text": "The GIL is here."},
+        {"start": 10.0, "text": "It is a mutex."},
+        {"start": 15.0, "text": "Conclusion."},
+    ]
+
+    result = extract_keyword_windows(segments, ["GIL", "mutex"], window_size=1)
+
+    assert len(result) == 1
+
+
+def test_extract_keyword_windows_keeps_separate_distant_windows():
+    # Matches far apart in the transcript should produce separate windows.
+    segments = [
+        {"start": 0.0,   "text": "The GIL is introduced."},
+        {"start": 10.0,  "text": "Unrelated content."},
+        {"start": 20.0,  "text": "More unrelated content."},
+        {"start": 30.0,  "text": "Still unrelated."},
+        {"start": 40.0,  "text": "The mutex is explained."},
+    ]
+
+    result = extract_keyword_windows(segments, ["GIL", "mutex"], window_size=0)
+
+    assert len(result) == 2
+
+
+def test_extract_keyword_windows_respects_configurable_window_size():
+    # window_size=0 means only the matching segment itself, no context.
+    result_narrow = extract_keyword_windows(_SEGMENTS, ["GIL"], window_size=0)
+    result_wide   = extract_keyword_windows(_SEGMENTS, ["GIL"], window_size=2)
+
+    # Wider window should include more text.
+    narrow_text = " ".join(w["text"] for w in result_narrow)
+    wide_text   = " ".join(w["text"] for w in result_wide)
+    assert len(wide_text) > len(narrow_text)
+
+
+def test_extract_keyword_windows_returns_start_timestamp_of_first_segment_in_window():
+    # The "start" field of each window should be the timestamp of its first segment.
+    result = extract_keyword_windows(_SEGMENTS, ["GIL"], window_size=1)
+
+    # Segment 1 ("Today we discuss the GIL.") is at 5.0s.
+    # window_size=1 pulls in segment 0 (0.0s) as the leading context.
+    assert result[0]["start"] == 0.0
+
+
+def test_extract_keyword_windows_concatenates_text_of_all_segments_in_window():
+    # Text from every segment in the merged window should appear in the output.
+    result = extract_keyword_windows(_SEGMENTS, ["GIL"], window_size=1)
+
+    combined = " ".join(w["text"] for w in result)
+    assert "Welcome to this video" in combined   # segment 0 (context before match)
+    assert "Today we discuss the GIL" in combined  # segment 1 (the match)
+    assert "mutex" in combined                    # segment 2 (context after match)
+
+
+# ===========================================================================
+# Group P — build_video_excerpts()
+# ===========================================================================
+
+_VIDEO_ID_A = "video_aaaaaa"
+_VIDEO_ID_B = "video_bbbbbb"
+
+_VIDEO_A = VideoResult(
+    video_id=_VIDEO_ID_A,
+    title="Understanding the GIL",
+    url=f"https://www.youtube.com/watch?v={_VIDEO_ID_A}",
+    description=None, view_count=None, duration_seconds=None,
+)
+_VIDEO_B = VideoResult(
+    video_id=_VIDEO_ID_B,
+    title="Python Asyncio Tutorial",
+    url=f"https://www.youtube.com/watch?v={_VIDEO_ID_B}",
+    description=None, view_count=None, duration_seconds=None,
+)
+
+_SEGMENTS_A = [
+    {"start": 0.0,  "text": "Welcome."},
+    {"start": 5.0,  "text": "The GIL protects Python objects."},
+    {"start": 10.0, "text": "It prevents true parallelism."},
+]
+_SEGMENTS_B = [
+    {"start": 0.0,  "text": "Asyncio is an event loop."},
+    {"start": 5.0,  "text": "It handles concurrency differently."},
+]
+
+
+def test_build_video_excerpts_returns_empty_dict_when_no_videos_match():
+    # No video's segments contain "asyncio" so the result should be empty.
+    excerpts = build_video_excerpts(
+        {_VIDEO_ID_A: _VIDEO_A},
+        {_VIDEO_ID_A: _SEGMENTS_A},
+        keywords=["asyncio"],
+    )
+
+    assert excerpts == {}
+
+
+def test_build_video_excerpts_skips_videos_with_no_keyword_matches():
+    # Video B has no segments matching "GIL", so it must not appear in the output.
+    excerpts = build_video_excerpts(
+        {_VIDEO_ID_A: _VIDEO_A, _VIDEO_ID_B: _VIDEO_B},
+        {_VIDEO_ID_A: _SEGMENTS_A, _VIDEO_ID_B: _SEGMENTS_B},
+        keywords=["GIL"],
+    )
+
+    assert _VIDEO_ID_B not in excerpts
+
+
+def test_build_video_excerpts_includes_videos_with_keyword_matches():
+    # Video A contains "GIL" so it must appear in the output.
+    excerpts = build_video_excerpts(
+        {_VIDEO_ID_A: _VIDEO_A},
+        {_VIDEO_ID_A: _SEGMENTS_A},
+        keywords=["GIL"],
+    )
+
+    assert _VIDEO_ID_A in excerpts
+
+
+def test_build_video_excerpts_includes_title_and_url_from_video_result():
+    excerpts = build_video_excerpts(
+        {_VIDEO_ID_A: _VIDEO_A},
+        {_VIDEO_ID_A: _SEGMENTS_A},
+        keywords=["GIL"],
+    )
+
+    assert excerpts[_VIDEO_ID_A]["title"] == _VIDEO_A.title
+    assert excerpts[_VIDEO_ID_A]["url"] == _VIDEO_A.url
+
+
+def test_build_video_excerpts_includes_non_empty_excerpts_list():
+    excerpts = build_video_excerpts(
+        {_VIDEO_ID_A: _VIDEO_A},
+        {_VIDEO_ID_A: _SEGMENTS_A},
+        keywords=["GIL"],
+    )
+
+    assert len(excerpts[_VIDEO_ID_A]["excerpts"]) > 0
+
+
+def test_build_video_excerpts_passes_window_size_to_keyword_matching():
+    # window_size=0 should produce shorter excerpts than window_size=2.
+    excerpts_narrow = build_video_excerpts(
+        {_VIDEO_ID_A: _VIDEO_A},
+        {_VIDEO_ID_A: _SEGMENTS_A},
+        keywords=["GIL"],
+        window_size=0,
+    )
+    excerpts_wide = build_video_excerpts(
+        {_VIDEO_ID_A: _VIDEO_A},
+        {_VIDEO_ID_A: _SEGMENTS_A},
+        keywords=["GIL"],
+        window_size=2,
+    )
+
+    narrow_text = excerpts_narrow[_VIDEO_ID_A]["excerpts"][0]["text"]
+    wide_text   = excerpts_wide[_VIDEO_ID_A]["excerpts"][0]["text"]
+    assert len(wide_text) > len(narrow_text)
+
+
+# ===========================================================================
+# Group F — run_agent_loop() planning phase
 # ===========================================================================
 
 SEARCH_QUERY = "how does Python GIL work"
-TOOL_USE_ID = "tu_abc123"
 DEFAULT_MODEL = "claude-3-opus-20240229"
+
+SELECTED_VIDEO_ID = "abc1234defg"
+SELECTED_VIDEO_TITLE = "Understanding the GIL"
+SELECTED_VIDEO_URL = f"https://www.youtube.com/watch?v={SELECTED_VIDEO_ID}"
+SELECTED_TRANSCRIPT = "The GIL is a mutex that protects Python objects."
+SYNTHESIS_ANSWER = f"The GIL protects objects. See **[{SELECTED_VIDEO_TITLE}]({SELECTED_VIDEO_URL})**"
+
+SEGMENTS_WITH_TIMESTAMPS = [
+    {"start": 0.0,   "text": "Hello everyone."},
+    {"start": 5.5,   "text": "Today we talk about the GIL."},
+    {"start": 135.0, "text": "The GIL is a mutex."},
+]
 
 
 def _make_client(*responses) -> MagicMock:
@@ -339,63 +613,27 @@ def _make_client(*responses) -> MagicMock:
     return client
 
 
-def test_run_agent_loop_sends_youtube_search_tool_definition_to_claude_on_first_call(mocker):
-    # Claude returns end_turn immediately with no videos selected.
+def test_run_agent_loop_makes_planning_call_with_plan_search_tool(mocker):
+    # First Claude call must offer the plan_search tool so Claude can specify
+    # what to search for and what keywords to look for in transcripts.
     mocker.patch("ytsearch.search_youtube", return_value=[])
     client = _make_client(
-        _end_turn_response('<selected_videos>[]</selected_videos>'),
-        _make_synthesis_response("No results found."),
+        _plan_response(["python GIL"], ["GIL"]),
+        _make_synthesis_response("No info found."),
     )
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
 
     first_call_kwargs = client.messages.create.call_args_list[0].kwargs
     tool_names = [t["name"] for t in first_call_kwargs["tools"]]
-    assert "youtube_search" in tool_names
+    assert "plan_search" in tool_names
 
 
-def test_run_agent_loop_calls_search_youtube_when_claude_returns_tool_use_block(mocker):
+def test_run_agent_loop_calls_search_youtube_for_each_query_in_plan(mocker):
+    # One search_youtube call must be made per query returned by the planning step.
     mock_search = mocker.patch("ytsearch.search_youtube", return_value=[])
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response('<selected_videos>[]</selected_videos>'),
-        _make_synthesis_response("Answer here."),
-    )
-
-    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
-
-    mock_search.assert_called_once_with("Python GIL", 5)
-
-
-def test_run_agent_loop_sends_tool_result_back_to_claude_after_search(mocker):
-    mocker.patch("ytsearch.search_youtube", return_value=[])
-    client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response('<selected_videos>[]</selected_videos>'),
-        _make_synthesis_response("Answer."),
-    )
-
-    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
-
-    # Second call to messages.create should include the tool_result in messages.
-    second_call_messages = client.messages.create.call_args_list[1].kwargs["messages"]
-    tool_result_messages = [
-        m for m in second_call_messages
-        if isinstance(m.get("content"), list)
-        and any(
-            isinstance(b, dict) and b.get("type") == "tool_result"
-            for b in m["content"]
-        )
-    ]
-    assert len(tool_result_messages) == 1
-
-
-def test_run_agent_loop_loops_and_calls_search_youtube_again_on_second_tool_use(mocker):
-    mock_search = mocker.patch("ytsearch.search_youtube", return_value=[])
-    client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _tool_use_response("tu_second_call", {"query": "Python GIL explained"}),
-        _end_turn_response('<selected_videos>[]</selected_videos>'),
+        _plan_response(["python GIL", "GIL threading python"], ["GIL"]),
         _make_synthesis_response("Answer."),
     )
 
@@ -404,130 +642,56 @@ def test_run_agent_loop_loops_and_calls_search_youtube_again_on_second_tool_use(
     assert mock_search.call_count == 2
 
 
-def test_run_agent_loop_stops_search_loop_when_claude_returns_end_turn_with_no_tool_use(mocker):
-    mock_search = mocker.patch("ytsearch.search_youtube", return_value=[])
-    client = _make_client(
-        _end_turn_response('<selected_videos>[]</selected_videos>'),
-        _make_synthesis_response("Nothing found."),
+def test_run_agent_loop_deduplicates_videos_from_multiple_searches(mocker):
+    # If the same video appears in two search results it should only be
+    # fetched once — deduplication keyed on video_id.
+    shared_video = VideoResult(
+        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
     )
-
-    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
-
-    mock_search.assert_not_called()
-
-
-# ===========================================================================
-# Group G — run_agent_loop() synthesis phase
-# ===========================================================================
-
-SELECTED_VIDEO_ID = "abc1234defg"
-SELECTED_VIDEO_TITLE = "Understanding the GIL"
-SELECTED_VIDEO_URL = f"https://www.youtube.com/watch?v={SELECTED_VIDEO_ID}"
-SELECTED_TRANSCRIPT = "The GIL is a mutex that protects Python objects."
-SYNTHESIS_ANSWER = f"The GIL protects objects. See **[{SELECTED_VIDEO_TITLE}]({SELECTED_VIDEO_URL})**"
-
-
-SEGMENTS_WITH_TIMESTAMPS = [
-    {"start": 0.0, "text": "Hello everyone."},
-    {"start": 5.5, "text": "Today we talk about the GIL."},
-    {"start": 135.0, "text": "The GIL is a mutex."},
-]
-
-
-def _setup_synthesis_scenario(mocker):
-    """
-    Claude's search phase names one video; that transcript is fetched and given
-    to the synthesis call. Returns (client, mock_load_transcript).
-    """
-    search_result = VideoResult(
-        video_id=SELECTED_VIDEO_ID,
-        title=SELECTED_VIDEO_TITLE,
-        url=SELECTED_VIDEO_URL,
-        description=None,
-        view_count=None,
-        duration_seconds=None,
-    )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-
-    mock_load = mocker.patch(
-        "ytsearch.load_transcript",
-        return_value=(SELECTED_TRANSCRIPT, False),
-    )
-    # No JSON sidecar — fall back to plain-text transcript in synthesis.
+    mocker.patch("ytsearch.search_youtube", return_value=[shared_video])
+    mock_load = mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
     mocker.patch("ytsearch.load_transcript_segments", return_value=None)
-
-    end_turn_text = (
-        f'I found a great video. '
-        f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'
-    )
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(end_turn_text),
-        _make_synthesis_response(SYNTHESIS_ANSWER),
+        _plan_response(["query one", "query two"], ["GIL"]),
+        _make_synthesis_response("Answer."),
     )
-    return client, mock_load
-
-
-def test_run_agent_loop_fetches_transcripts_for_video_ids_mentioned_by_claude(mocker):
-    client, mock_load = _setup_synthesis_scenario(mocker)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
 
-    mock_load.assert_called_once_with(SELECTED_VIDEO_ID)
+    assert mock_load.call_count == 1
 
 
-def test_run_agent_loop_includes_transcript_content_in_synthesis_prompt(mocker):
-    client, _mock_fetch = _setup_synthesis_scenario(mocker)
-
-    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
-
-    synthesis_call_messages = client.messages.create.call_args_list[-1].kwargs["messages"]
-    combined_content = " ".join(
-        m["content"] for m in synthesis_call_messages if isinstance(m.get("content"), str)
+def test_run_agent_loop_reports_each_search_query_via_status_callback(mocker):
+    # The TUI should show which queries are being executed as they run.
+    mocker.patch("ytsearch.search_youtube", return_value=[])
+    status_events: list[tuple[str, str]] = []
+    client = _make_client(
+        _plan_response(["python GIL", "global interpreter lock"], ["GIL"]),
+        _make_synthesis_response("Answer."),
     )
-    assert SELECTED_TRANSCRIPT in combined_content
 
-
-def test_run_agent_loop_returns_text_from_claude_synthesis_response(mocker):
-    client, _mock_fetch = _setup_synthesis_scenario(mocker)
-
-    result = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
-
-    assert result == SYNTHESIS_ANSWER
-
-
-def test_run_agent_loop_includes_video_title_and_url_in_synthesis_context(mocker):
-    client, _mock_load = _setup_synthesis_scenario(mocker)
-
-    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
-
-    synthesis_call_messages = client.messages.create.call_args_list[-1].kwargs["messages"]
-    combined_content = " ".join(
-        m["content"] for m in synthesis_call_messages if isinstance(m.get("content"), str)
+    run_agent_loop(
+        SEARCH_QUERY, client, DEFAULT_MODEL,
+        status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
     )
-    assert SELECTED_VIDEO_TITLE in combined_content
-    assert SELECTED_VIDEO_URL in combined_content
+
+    search_messages = [m for m, _ in status_events if "search" in m.lower()]
+    assert len(search_messages) >= 2
 
 
 def test_run_agent_loop_reports_found_video_title_and_url_via_status_callback(mocker):
-    # After each search, the title and URL of every found video should be
-    # reported so the user can see what the agent discovered.
+    # After each search, title and URL of every new video should be shown.
     search_result = VideoResult(
-        video_id=SELECTED_VIDEO_ID,
-        title=SELECTED_VIDEO_TITLE,
-        url=SELECTED_VIDEO_URL,
-        description=None,
-        view_count=None,
-        duration_seconds=None,
+        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
     mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
     mocker.patch("ytsearch.load_transcript_segments", return_value=None)
-
     status_events: list[tuple[str, str]] = []
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
 
@@ -536,32 +700,105 @@ def test_run_agent_loop_reports_found_video_title_and_url_via_status_callback(mo
         status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
     )
 
-    found_messages = [m for m, _k in status_events if SELECTED_VIDEO_TITLE in m]
+    found_messages = [m for m, _ in status_events if SELECTED_VIDEO_TITLE in m]
     assert len(found_messages) >= 1
     assert any(SELECTED_VIDEO_URL in m for m in found_messages)
 
 
-def test_run_agent_loop_reports_transcript_fetch_per_video_via_status_callback(mocker):
-    # The user should see which video's transcript is being fetched before the
-    # network call happens, so long waits feel informative.
+# ===========================================================================
+# Group G — run_agent_loop() synthesis phase
+# ===========================================================================
+
+def _setup_synthesis_scenario(mocker):
+    """
+    Planning returns one search query + keywords; the video's transcript segments
+    contain the keywords so excerpts are extracted and sent to synthesis.
+    Returns (client, mock_load_transcript).
+    """
     search_result = VideoResult(
-        video_id=SELECTED_VIDEO_ID,
-        title=SELECTED_VIDEO_TITLE,
-        url=SELECTED_VIDEO_URL,
-        description=None,
-        view_count=None,
-        duration_seconds=None,
+        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
-    mocker.patch("ytsearch.load_transcript_segments", return_value=None)
+    mock_load = mocker.patch(
+        "ytsearch.load_transcript",
+        return_value=(SELECTED_TRANSCRIPT, False),
+    )
+    # Segments contain "GIL" and "mutex" — both are in PLAN_KEYWORDS.
+    mocker.patch("ytsearch.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
 
-    status_messages: list[str] = []
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _plan_response(["Python GIL"], ["GIL", "mutex"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
+    return client, mock_load
+
+
+def test_run_agent_loop_fetches_transcripts_for_all_discovered_videos(mocker):
+    # Every video found during the search phase should have its transcript fetched.
+    client, mock_load = _setup_synthesis_scenario(mocker)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    mock_load.assert_called_once_with(SELECTED_VIDEO_ID)
+
+
+def test_run_agent_loop_includes_keyword_matched_excerpts_in_synthesis_prompt(mocker):
+    # Synthesis prompt must contain text from the keyword-matching segments,
+    # not the full transcript verbatim.
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    synthesis_messages = client.messages.create.call_args_list[-1].kwargs["messages"]
+    combined_content = " ".join(
+        m["content"] for m in synthesis_messages if isinstance(m.get("content"), str)
+    )
+    # "Today we talk about the GIL." is in SEGMENTS_WITH_TIMESTAMPS and matches keyword "GIL".
+    assert "Today we talk about the GIL" in combined_content
+
+
+def test_run_agent_loop_returns_text_from_claude_synthesis_response(mocker):
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    result = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    assert result == SYNTHESIS_ANSWER
+
+
+def test_run_agent_loop_includes_video_title_and_url_in_synthesis_context(mocker):
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    synthesis_messages = client.messages.create.call_args_list[-1].kwargs["messages"]
+    combined_content = " ".join(
+        m["content"] for m in synthesis_messages if isinstance(m.get("content"), str)
+    )
+    assert SELECTED_VIDEO_TITLE in combined_content
+    assert SELECTED_VIDEO_URL in combined_content
+
+
+def test_run_agent_loop_includes_timestamps_in_synthesis_excerpts(mocker):
+    # Excerpt windows carry [M:SS] timestamps so Claude can produce cited answers.
+    # window_size=0 keeps each matching segment isolated so the 135s segment
+    # ([2:15]) appears as its own excerpt rather than being merged into [0:00].
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, window_size=0)
+
+    synthesis_messages = client.messages.create.call_args_list[-1].kwargs["messages"]
+    combined_content = " ".join(
+        m["content"] for m in synthesis_messages if isinstance(m.get("content"), str)
+    )
+    # 135 seconds → [2:15] from SEGMENTS_WITH_TIMESTAMPS
+    assert "[2:15]" in combined_content
+
+
+def test_run_agent_loop_reports_transcript_fetch_per_video_via_status_callback(mocker):
+    # The user should see which video's transcript is being fetched.
+    client, _ = _setup_synthesis_scenario(mocker)
+    status_messages: list[str] = []
 
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
@@ -573,11 +810,10 @@ def test_run_agent_loop_reports_transcript_fetch_per_video_via_status_callback(m
 
 
 def test_run_agent_loop_uses_success_kind_when_transcript_loads(mocker):
-    # A green "Loaded" signal lets the user see at a glance which videos
-    # contributed to the final answer.
+    # A green "Loaded" signal lets the user see which videos contributed.
     client, _ = _setup_synthesis_scenario(mocker)
-
     status_events: list[tuple[str, str]] = []
+
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
         status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
@@ -589,8 +825,7 @@ def test_run_agent_loop_uses_success_kind_when_transcript_loads(mocker):
 
 
 def test_run_agent_loop_uses_skip_kind_when_no_captions_available(mocker):
-    # A visually distinct (yellow) "skip" signal lets the user know why a
-    # video that was found is absent from the answer.
+    # A yellow "skip" signal distinguishes no-captions from fetch errors.
     from youtube_transcript_api import CouldNotRetrieveTranscript
 
     search_result = VideoResult(
@@ -599,11 +834,9 @@ def test_run_agent_loop_uses_skip_kind_when_no_captions_available(mocker):
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
     mocker.patch("ytsearch.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
-
     status_events: list[tuple[str, str]] = []
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
 
@@ -616,66 +849,19 @@ def test_run_agent_loop_uses_skip_kind_when_no_captions_available(mocker):
     assert len(skip_events) >= 1
 
 
-def test_run_agent_loop_falls_back_to_other_discovered_videos_when_selected_transcript_unavailable(mocker):
-    # When a selected video has no captions, the agent tries other videos
-    # that were found during searching rather than giving up.
-    from youtube_transcript_api import CouldNotRetrieveTranscript
-
-    FALLBACK_VIDEO_ID = "fallback_vid_aa"
-    selected = VideoResult(
-        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
-        description=None, view_count=None, duration_seconds=None,
-    )
-    fallback = VideoResult(
-        video_id=FALLBACK_VIDEO_ID, title="Fallback Video",
-        url=f"https://www.youtube.com/watch?v={FALLBACK_VIDEO_ID}",
-        description=None, view_count=None, duration_seconds=None,
-    )
-    # Both appear in search results; Claude selects only the first.
-    mocker.patch("ytsearch.search_youtube", return_value=[selected, fallback])
-
-    def load_side_effect(video_id):
-        if video_id == SELECTED_VIDEO_ID:
-            raise CouldNotRetrieveTranscript(SELECTED_VIDEO_ID)
-        return (SELECTED_TRANSCRIPT, False)
-
-    mock_load = mocker.patch("ytsearch.load_transcript", side_effect=load_side_effect)
-    mocker.patch("ytsearch.load_transcript_segments", return_value=None)
-
-    client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
-        _make_synthesis_response(SYNTHESIS_ANSWER),
-    )
-
-    run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
-
-    mock_load.assert_any_call(FALLBACK_VIDEO_ID)
-
-
-def test_run_agent_loop_reports_no_captions_when_transcript_unavailable(mocker):
-    # When a video has no captions the user should see "no captions available"
-    # rather than a generic error, because it is a normal YouTube condition.
+def test_run_agent_loop_reports_no_captions_message_in_status(mocker):
+    # Message text should clearly say "no captions" not a generic error.
     from youtube_transcript_api import CouldNotRetrieveTranscript
 
     search_result = VideoResult(
-        video_id=SELECTED_VIDEO_ID,
-        title=SELECTED_VIDEO_TITLE,
-        url=SELECTED_VIDEO_URL,
-        description=None,
-        view_count=None,
-        duration_seconds=None,
+        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch(
-        "ytsearch.load_transcript",
-        side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID),
-    )
-
+    mocker.patch("ytsearch.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
     status_events: list[tuple[str, str]] = []
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
 
@@ -684,28 +870,23 @@ def test_run_agent_loop_reports_no_captions_when_transcript_unavailable(mocker):
         status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
     )
 
-    skip_messages = [m for m, _k in status_events if "no captions" in m.lower()]
-    assert len(skip_messages) == 1
+    skip_messages = [m for m, _ in status_events if "no captions" in m.lower()]
+    assert len(skip_messages) >= 1
 
 
-def test_run_agent_loop_includes_timestamps_in_synthesis_when_segments_available(mocker):
-    # When a JSON sidecar with timestamps exists, the synthesis prompt should
-    # contain [M:SS] markers so Claude can cite specific moments in the video.
+def test_run_agent_loop_skips_videos_with_no_keyword_matches_in_synthesis(mocker):
+    # A video whose transcript contains none of the planned keywords should not
+    # appear in the synthesis context — it has no relevant content.
     search_result = VideoResult(
-        video_id=SELECTED_VIDEO_ID,
-        title=SELECTED_VIDEO_TITLE,
-        url=SELECTED_VIDEO_URL,
-        description=None,
-        view_count=None,
-        duration_seconds=None,
+        video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
     mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
+    # Segments contain no keyword match for "asyncio".
     mocker.patch("ytsearch.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
-
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _plan_response(["Python asyncio"], ["asyncio", "event loop"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
 
@@ -715,16 +896,12 @@ def test_run_agent_loop_includes_timestamps_in_synthesis_when_segments_available
     combined_content = " ".join(
         m["content"] for m in synthesis_messages if isinstance(m.get("content"), str)
     )
-    # 135 seconds → [2:15] from SEGMENTS_WITH_TIMESTAMPS
-    assert "[2:15]" in combined_content
+    assert SELECTED_VIDEO_TITLE not in combined_content
 
 
 # ===========================================================================
 # Group M — _create_with_retry() transient error handling
 # ===========================================================================
-
-# A fake exception that mimics the shape of Anthropic SDK HTTP errors,
-# which expose the HTTP status code via a `.status_code` attribute.
 
 class _FakeAPIError(Exception):
     def __init__(self, status_code: int) -> None:
@@ -879,22 +1056,22 @@ def test_main_prompts_for_query_via_input_when_no_argument_given(mocker):
 # Group L — run_agent_loop() session logging integration
 # ===========================================================================
 
-def test_run_agent_loop_records_claude_search_response_in_session_log(mocker):
-    # Every Claude response in the search phase must be captured so we can
-    # see Claude's reasoning (text blocks) and tool calls when reviewing logs.
+def test_run_agent_loop_records_claude_planning_response_in_session_log(mocker):
+    # The planning call result must be captured to review what search strategy
+    # and keywords Claude chose — essential for evaluating agent quality.
     mocker.patch("ytsearch.search_youtube", return_value=[])
     client = _make_client(
-        _end_turn_response('<selected_videos>[]</selected_videos>'),
+        _plan_response(["python GIL"], ["GIL"]),
         _make_synthesis_response("No results."),
     )
     log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
 
     run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL, session_log=log)
 
-    response_events = [e for e in log.events if e["type"] == "claude_search_response"]
-    assert len(response_events) >= 1
-    assert "stop_reason" in response_events[0]
-    assert "content" in response_events[0]
+    planning_events = [e for e in log.events if e["type"] == "claude_planning_response"]
+    assert len(planning_events) == 1
+    assert "search_queries" in planning_events[0]
+    assert "transcript_keywords" in planning_events[0]
 
 
 def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(mocker):
@@ -908,8 +1085,7 @@ def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(
     mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
     mocker.patch("ytsearch.load_transcript_segments", return_value=None)
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
     log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
@@ -923,7 +1099,7 @@ def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(
 
 
 def test_run_agent_loop_records_transcript_fetch_success_in_session_log(mocker):
-    # Success events let us see which videos actually contributed to the answer.
+    # Success events show which videos actually contributed to the answer.
     client, _ = _setup_synthesis_scenario(mocker)
     log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
 
@@ -945,8 +1121,7 @@ def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker):
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
     mocker.patch("ytsearch.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
     client = _make_client(
-        _tool_use_response(TOOL_USE_ID, {"query": "Python GIL"}),
-        _end_turn_response(f'<selected_videos>["{SELECTED_VIDEO_ID}"]</selected_videos>'),
+        _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
     )
     log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
@@ -957,9 +1132,9 @@ def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker):
     assert any(e["status"] == "no_captions" for e in fetch_events)
 
 
-def test_run_agent_loop_records_synthesis_input_with_transcript_context(mocker):
-    # The full transcript context passed to the synthesis call must be logged
-    # so reviewers can judge whether Claude had enough information.
+def test_run_agent_loop_records_synthesis_input_with_excerpt_context(mocker):
+    # The excerpt context passed to synthesis must be logged so reviewers
+    # can judge whether Claude had enough relevant content.
     client, _ = _setup_synthesis_scenario(mocker)
     log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
 
@@ -967,12 +1142,13 @@ def test_run_agent_loop_records_synthesis_input_with_transcript_context(mocker):
 
     synthesis_input_events = [e for e in log.events if e["type"] == "synthesis_input"]
     assert len(synthesis_input_events) == 1
-    assert SELECTED_TRANSCRIPT in synthesis_input_events[0]["transcript_context"]
+    # Excerpt context should contain text from the keyword-matching segments.
+    assert "Today we talk about the GIL" in synthesis_input_events[0]["transcript_context"]
 
 
 def test_run_agent_loop_records_synthesis_output_answer_in_session_log(mocker):
-    # The final answer is stored verbatim so log files are self-contained
-    # for offline evaluation without re-running the agent.
+    # The final answer is stored verbatim so logs are self-contained for
+    # offline evaluation without re-running the agent.
     client, _ = _setup_synthesis_scenario(mocker)
     log = SessionLog(query=SEARCH_QUERY, model=DEFAULT_MODEL)
 
