@@ -1,9 +1,9 @@
-# ytqa + ytsearch — YouTube Transcript Tools
+# ytask — YouTube Research Assistant
 
 Two Claude-powered TUI tools for learning from YouTube:
 
+- **`ytask`** — Describe what you want to learn; an agent searches YouTube, reads transcripts, synthesises a cited answer, and continues the conversation with follow-up questions
 - **`ytqa`** — Q&A a single video you already know
-- **`ytsearch`** — Describe what you want to learn; an agent searches YouTube, reads transcripts, and synthesises a cited answer
 
 ## Requirements
 
@@ -35,16 +35,16 @@ uv run python ytqa.py https://youtu.be/VIDEO_ID
 
 Launches an interactive chat TUI. A summary of the video is shown on load, then you can ask follow-up questions. Press `Ctrl+Q` to exit.
 
-### ytsearch — agentic search
+### ytask — agentic search and conversation
 
 ```bash
-uv run python ytsearch.py "how does Python's GIL work"
+uv run python ytask.py "how does Python's GIL work"
 ```
 
 Or run without arguments to be prompted:
 
 ```bash
-uv run python ytsearch.py
+uv run python ytask.py
 ```
 
 The agent runs in five phases:
@@ -55,11 +55,13 @@ The agent runs in five phases:
 4. **Keyword matching** — Transcript segments (and video descriptions) matching any planned keyword are extracted with surrounding context as `[M:SS]` timestamped excerpts. The TUI shows which keywords hit or missed per video and a summary of which keywords appeared in any video. Videos with no matching segments are skipped.
 5. **Synthesising** — Claude synthesises the matching excerpts into a cited Markdown answer. Each citation includes the video title, URL, and nearest timestamp.
 
-The TUI also shows the running LLM cost (input + output tokens and cumulative USD) after each API call. Answers include `[M:SS]` timestamp citations so you can jump to the relevant moment in each video. Press `Ctrl+Q` to exit.
+After the answer is shown, the input stays active for follow-up questions. Claude answers from the accumulated transcript context when possible, or searches YouTube for more content when needed. All fetched transcripts are retained across the conversation. Press `Ctrl+R` to start a fresh search, or `Ctrl+Q` to exit.
+
+The TUI also shows the running LLM cost (input + output tokens and cumulative USD) after each API call. Answers include `[M:SS]` timestamp citations so you can jump to the relevant moment in each video.
 
 ## Session logs
 
-Every `ytsearch` query writes a structured JSON log to `logs/`:
+Every `ytask` query writes a structured JSON log to `logs/`:
 
 ```
 logs/2026-06-23T16-18-17_how-does-python-s-gil-work.json
@@ -74,18 +76,19 @@ Each log captures the full agent session in order:
 | `youtube_search_error` | Query and error when yt-dlp fails |
 | `transcript_fetch` | Per-video outcome: `success`, `no_captions` (with `reason`), `ip_blocked`, or `failed` |
 | `synthesis_input` | Which videos had keyword matches and the full excerpt context given to Claude |
-| `synthesis_output` | The final answer verbatim |
+| `synthesis_output` | The initial answer verbatim |
+| `followup_output` | Each follow-up question and Claude's answer |
 
 Every event has an ISO timestamp. Log files are self-contained for offline agent evaluation. The TUI shows the log path after each completed query.
 
 ## Notes
 
-- `ytsearch` works best when videos have captions. It tries manual captions first, then auto-generated, then translated — so many non-English videos are covered too. Videos with subtitles entirely disabled are skipped with the reason shown.
+- `ytask` works best when videos have captions. It tries manual captions first, then auto-generated, then translated — so many non-English videos are covered too. Videos with subtitles entirely disabled are skipped with the reason shown.
 - If YouTube rate-limits the host (e.g. on a VPN or cloud IP), the TUI shows which videos were blocked and suggests disabling the VPN.
-- If a video has multiple transcript tracks, you'll be prompted to choose one before the TUI launches (ytqa only).
+- If a video has multiple transcript tracks, you'll be prompted to choose one before the TUI launches (`ytqa` only).
 - `ytqa` responses are in the same language as the transcript.
 - Transcripts are cached in `transcripts/<video_id>.txt` and `transcripts/<video_id>.json` (with timestamps) — subsequent runs on the same or similar topics reuse cached files, making keyword matching fast.
-- `ytsearch` shows running LLM cost after each API call. `ytqa` shows it in the header.
+- `ytask` shows running LLM cost after each API call. `ytqa` shows it in the header.
 - `logs/` and `transcripts/` are gitignored.
 
 ## Running tests
