@@ -250,7 +250,7 @@ def fetch_transcripts_for_videos(video_ids: list[str]) -> dict[str, str]:
     transcripts: dict[str, str] = {}
     for video_id in video_ids:
         try:
-            text, _ = load_transcript(video_id)
+            text, _, _source = load_transcript(video_id)
             transcripts[video_id] = text
         except Exception:
             pass
@@ -331,10 +331,40 @@ def build_video_excerpts(
     return result
 
 
+def _description_to_segments(description: str, chunk_words: int = 50) -> list[dict]:
+    """Split a video description into fixed-word chunks for keyword matching."""
+    words = description.split()
+    return [
+        {"start": None, "text": " ".join(words[i : i + chunk_words])}
+        for i in range(0, len(words), chunk_words)
+        if words[i : i + chunk_words]
+    ]
+
+
 def _format_excerpt_window(window: dict) -> str:
+    if window["start"] is None:
+        return f"[description] {window['text']}"
     total = int(window["start"])
     ts = f"{total // 60}:{total % 60:02d}"
     return f"[{ts}] {window['text']}"
+
+
+def _keywords_matched_in_segments(segments: list[dict], keywords: list[str]) -> list[str]:
+    """Return the subset of keywords found in at least one segment (case-insensitive)."""
+    kw_pairs = [(kw, kw.lower()) for kw in keywords]
+    return [kw for kw, kw_l in kw_pairs if any(kw_l in seg["text"].lower() for seg in segments)]
+
+
+def _no_transcript_reason(exc: CouldNotRetrieveTranscript) -> str:
+    """Extract a short human-readable reason from a CouldNotRetrieveTranscript exception."""
+    msg = str(exc)
+    marker = "This is most likely caused by:"
+    if marker in msg:
+        after = msg.split(marker, 1)[1].strip()
+        reason = after.split("\n")[0].strip()
+        if reason:
+            return reason
+    return "no captions available"
 
 
 def run_agent_loop(
@@ -424,18 +454,20 @@ def run_agent_loop(
 
     segments_by_id: dict[str, list[dict]] = {}
     _segments_lock = threading.Lock()
+    _ip_blocked = threading.Event()
 
     def _fetch_one(video_id: str, title: str) -> None:
         if status_callback:
-            status_callback(f"Fetching transcript: {title}…", "info")
+            status_callback(f"Fetching: {title}…", "info", widget_key=video_id)
         try:
-            text, _ = load_transcript(video_id, auto=True)
+            text, _, source = load_transcript(video_id, auto=True)
             segs = load_transcript_segments(video_id)
             if segs:
                 with _segments_lock:
                     segments_by_id[video_id] = segs
             if status_callback:
-                status_callback(f"Loaded: {title}", "success")
+                suffix = f" [dim]({source})[/dim]" if source else ""
+                status_callback(f"[green]Loaded: {escape(title)}{suffix}[/green]", "markup", widget_key=video_id)
             if session_log:
                 session_log.record(
                     "transcript_fetch",
@@ -482,12 +514,37 @@ def run_agent_loop(
     )
 
     if status_callback:
+        all_matched_keywords: set[str] = set()
         for video_id, video in all_video_results.items():
+            segs = segments_by_id.get(video_id, [])
+            matched_kws = set(_keywords_matched_in_segments(segs, transcript_keywords)) if segs else set()
+            all_matched_keywords.update(matched_kws)
             if video_id in video_excerpts:
                 n = len(video_excerpts[video_id]["excerpts"])
-                status_callback(f"Matched: {video.title} ({n} excerpt{'s' if n != 1 else ''})", "success")
-            elif video_id in segments_by_id:
+                excerpt_label = f"excerpt{'s' if n != 1 else ''}"
+                status_callback(
+                    f"[green]Matched: {escape(video.title)} ({n} {excerpt_label})[/green]",
+                    "markup",
+                )
+            elif segs:
                 status_callback(f"No matches: {video.title}", "skip")
+            else:
+                continue
+            if transcript_keywords and video_id in video_excerpts:
+                parts = []
+                for kw in transcript_keywords:
+                    if kw in matched_kws:
+                        parts.append(f"[cyan bold]✓ {escape(kw)}[/cyan bold]")
+                    else:
+                        parts.append(f"[dim]✗ {escape(kw)}[/dim]")
+                status_callback(f"  {'  '.join(parts)}", "markup")
+        unmatched_kws = [kw for kw in transcript_keywords if kw not in all_matched_keywords]
+        if all_matched_keywords:
+            kws = escape(", ".join(sorted(all_matched_keywords)))
+            status_callback(f"[green]Keywords found:[/green] [cyan bold]{kws}[/cyan bold]", "markup")
+        if unmatched_kws:
+            kws = escape(", ".join(unmatched_kws))
+            status_callback(f"[yellow]Not found in any video:[/yellow] [red]{kws}[/red]", "markup")
 
     # --- Phase 5: Synthesising ---
     if status_callback:
@@ -549,6 +606,7 @@ class YtsearchApp(App):
         self._client = client
         self._model = model
         self._initial_query = initial_query
+        self._keyed_widgets: dict[str, Static] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -582,8 +640,10 @@ class YtsearchApp(App):
     def _run_search(self, query: str) -> None:
         log = SessionLog(query=query, model=self._model)
 
-        def status_callback(message: str, kind: str = "info") -> None:
-            self.call_from_thread(self._append_status, message, kind)
+        self._keyed_widgets.clear()
+
+        def status_callback(message: str, kind: str = "info", widget_key: str | None = None, **_kw) -> None:
+            self.call_from_thread(self._append_status, message, kind, widget_key)
 
         try:
             answer = run_agent_loop(query, self._client, self._model, status_callback, session_log=log)
@@ -595,10 +655,20 @@ class YtsearchApp(App):
             self.call_from_thread(self._append_status, f"Session logged → {log_path}", "info")
             self.call_from_thread(self._reenable_input)
 
-    def _append_status(self, message: str, kind: str = "info") -> None:
-        markup = _STATUS_MARKUP.get(kind, "dim")
-        chat_log = self.query_one("#chat-log", VerticalScroll)
-        chat_log.mount(Static(f"[{markup}]{escape(message)}[/{markup}]", classes="status-message"))
+    def _append_status(self, message: str, kind: str = "info", widget_key: str | None = None) -> None:
+        if kind == "markup":
+            content = message
+        else:
+            tag = _STATUS_MARKUP.get(kind, "dim")
+            content = f"[{tag}]{escape(message)}[/{tag}]"
+        if widget_key and widget_key in self._keyed_widgets:
+            self._keyed_widgets[widget_key].update(content)
+        else:
+            widget = Static(content, classes="status-message")
+            chat_log = self.query_one("#chat-log", VerticalScroll)
+            chat_log.mount(widget)
+            if widget_key:
+                self._keyed_widgets[widget_key] = widget
         self._scroll_to_bottom()
 
     def _show_answer(self, answer: str, log_path) -> None:

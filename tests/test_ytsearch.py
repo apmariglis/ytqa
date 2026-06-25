@@ -270,7 +270,7 @@ TRANSCRIPT_TEXT = "Hello world transcript."
 
 
 def test_fetch_transcripts_for_videos_returns_dict_keyed_by_video_id(mocker):
-    mocker.patch("ytsearch.load_transcript", return_value=(TRANSCRIPT_TEXT, True))
+    mocker.patch("ytsearch.load_transcript", return_value=(TRANSCRIPT_TEXT, True, None))
 
     result = fetch_transcripts_for_videos([TRANSCRIPT_VIDEO_ID])
 
@@ -278,7 +278,7 @@ def test_fetch_transcripts_for_videos_returns_dict_keyed_by_video_id(mocker):
 
 
 def test_fetch_transcripts_for_videos_calls_load_transcript_once_per_video_id(mocker):
-    mock_load = mocker.patch("ytsearch.load_transcript", return_value=(TRANSCRIPT_TEXT, True))
+    mock_load = mocker.patch("ytsearch.load_transcript", return_value=(TRANSCRIPT_TEXT, True, None))
 
     fetch_transcripts_for_videos(["vid_a1bbbbbbb", "vid_b2ccccccc"])
 
@@ -290,7 +290,7 @@ def test_fetch_transcripts_for_videos_skips_videos_where_transcript_fetch_fails(
     def load_side_effect(video_id):
         if video_id == "bad_vid_aaaa":
             raise RuntimeError("transcript unavailable")
-        return (TRANSCRIPT_TEXT, False)
+        return (TRANSCRIPT_TEXT, False, None)
 
     mocker.patch("ytsearch.load_transcript", side_effect=load_side_effect)
 
@@ -650,7 +650,7 @@ def test_run_agent_loop_deduplicates_videos_from_multiple_searches(mocker):
         description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[shared_video])
-    mock_load = mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
+    mock_load = mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
     mocker.patch("ytsearch.load_transcript_segments", return_value=None)
     client = _make_client(
         _plan_response(["query one", "query two"], ["GIL"]),
@@ -673,7 +673,7 @@ def test_run_agent_loop_reports_each_search_query_via_status_callback(mocker):
 
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
-        status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
+        status_callback=lambda msg, kind="info", **kw: status_events.append((msg, kind)),
     )
 
     search_messages = [m for m, _ in status_events if "search" in m.lower()]
@@ -687,7 +687,7 @@ def test_run_agent_loop_reports_found_video_title_and_url_via_status_callback(mo
         description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
+    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
     mocker.patch("ytsearch.load_transcript_segments", return_value=None)
     status_events: list[tuple[str, str]] = []
     client = _make_client(
@@ -697,7 +697,7 @@ def test_run_agent_loop_reports_found_video_title_and_url_via_status_callback(mo
 
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
-        status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
+        status_callback=lambda msg, kind="info", **kw: status_events.append((msg, kind)),
     )
 
     found_messages = [m for m, _ in status_events if SELECTED_VIDEO_TITLE in m]
@@ -722,7 +722,7 @@ def _setup_synthesis_scenario(mocker):
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
     mock_load = mocker.patch(
         "ytsearch.load_transcript",
-        return_value=(SELECTED_TRANSCRIPT, False),
+        return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"),
     )
     # Segments contain "GIL" and "mutex" — both are in PLAN_KEYWORDS.
     mocker.patch("ytsearch.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
@@ -802,10 +802,10 @@ def test_run_agent_loop_reports_transcript_fetch_per_video_via_status_callback(m
 
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
-        status_callback=lambda msg, kind="info": status_messages.append(msg),
+        status_callback=lambda msg, kind="info", **kw: status_messages.append(msg),
     )
 
-    fetch_messages = [m for m in status_messages if "transcript" in m.lower() and SELECTED_VIDEO_TITLE in m]
+    fetch_messages = [m for m in status_messages if SELECTED_VIDEO_TITLE in m]
     assert len(fetch_messages) >= 1
 
 
@@ -816,12 +816,11 @@ def test_run_agent_loop_uses_success_kind_when_transcript_loads(mocker):
 
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
-        status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
+        status_callback=lambda msg, kind="info", **kw: status_events.append((msg, kind)),
     )
 
-    success_events = [(m, k) for m, k in status_events if k == "success"]
-    assert len(success_events) >= 1
-    assert any(SELECTED_VIDEO_TITLE in m for m, _ in success_events)
+    loaded_events = [(m, k) for m, k in status_events if "Loaded" in m and SELECTED_VIDEO_TITLE in m]
+    assert len(loaded_events) >= 1
 
 
 def test_run_agent_loop_uses_skip_kind_when_no_captions_available(mocker):
@@ -867,7 +866,7 @@ def test_run_agent_loop_reports_no_captions_message_in_status(mocker):
 
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
-        status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
+        status_callback=lambda msg, kind="info", **kw: status_events.append((msg, kind)),
     )
 
     skip_messages = [m for m, _ in status_events if "no captions" in m.lower()]
@@ -882,7 +881,7 @@ def test_run_agent_loop_skips_videos_with_no_keyword_matches_in_synthesis(mocker
         description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
+    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
     # Segments contain no keyword match for "asyncio".
     mocker.patch("ytsearch.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
     client = _make_client(
@@ -1004,7 +1003,7 @@ def test_create_with_retry_notifies_status_callback_before_each_retry(mocker):
 
     ytsearch._create_with_retry(
         client,
-        lambda msg, kind="info": status_events.append((msg, kind)),
+        lambda msg, kind="info", **kw: status_events.append((msg, kind)),
         model="m",
         messages=[],
     )
@@ -1082,7 +1081,7 @@ def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(
         description=None, view_count=None, duration_seconds=None,
     )
     mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False))
+    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
     mocker.patch("ytsearch.load_transcript_segments", return_value=None)
     client = _make_client(
         _plan_response(["Python GIL"], ["GIL"]),
