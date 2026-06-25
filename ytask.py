@@ -826,6 +826,8 @@ class YtsearchApp(App):
         self._model = model
         self._initial_query = initial_query
         self._keyed_widgets: dict[str, Static] = {}
+        self._session: SearchSession | None = None
+        self._conversation: list[dict] = []
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -853,7 +855,16 @@ class YtsearchApp(App):
         chat_log.mount(Static(f"[bold cyan]You:[/bold cyan] {escape(query)}", classes="user-query"))
         self._scroll_to_bottom()
 
-        self._run_search(query)
+        if self._session is not None:
+            self._run_followup(query)
+        else:
+            self._run_search(query)
+
+    def action_new_search(self) -> None:
+        self._session = None
+        self._conversation = []
+        input_bar = self.query_one("#input-bar", Input)
+        input_bar.placeholder = "What do you want to learn from YouTube?"
 
     @work(thread=True)
     def _run_search(self, query: str) -> None:
@@ -865,14 +876,51 @@ class YtsearchApp(App):
             self.call_from_thread(self._append_status, message, kind, widget_key)
 
         try:
-            answer = run_agent_loop(query, self._client, self._model, status_callback, session_log=log)
+            session = run_agent_loop(query, self._client, self._model, status_callback, session_log=log)
             log_path = log.save()
-            self.call_from_thread(self._show_answer, answer, log_path)
+            self.call_from_thread(self._on_search_complete, query, session, log_path)
         except Exception as exc:
             log_path = log.save()
             self.call_from_thread(self._append_status, f"Error: {exc}", "error")
-            self.call_from_thread(self._append_status, f"Session logged → {log_path}", "info")
+            self.call_from_thread(self._append_status, f"Session logged -> {log_path}", "info")
             self.call_from_thread(self._reenable_input)
+
+    def _on_search_complete(self, query: str, session: SearchSession, log_path) -> None:
+        self._session = session
+        self._conversation = [
+            {"role": "user", "content": query},
+            {"role": "assistant", "content": session.answer},
+        ]
+        self._show_answer(session.answer, log_path)
+        input_bar = self.query_one("#input-bar", Input)
+        input_bar.placeholder = "Ask a follow-up... (Ctrl+R for new search)"
+
+    @work(thread=True)
+    def _run_followup(self, question: str) -> None:
+        log = SessionLog(query=question, model=self._model)
+
+        self._keyed_widgets.clear()
+
+        def status_callback(message: str, kind: str = "info", widget_key: str | None = None, **_kw) -> None:
+            self.call_from_thread(self._append_status, message, kind, widget_key)
+
+        try:
+            answer, updated_session = run_followup(
+                question, self._session, self._conversation,
+                self._client, self._model, status_callback, session_log=log,
+            )
+            log_path = log.save()
+            self.call_from_thread(self._on_followup_complete, question, answer, updated_session, log_path)
+        except Exception as exc:
+            log_path = log.save()
+            self.call_from_thread(self._append_status, f"Error: {exc}", "error")
+            self.call_from_thread(self._reenable_input)
+
+    def _on_followup_complete(self, question: str, answer: str, session: SearchSession, log_path) -> None:
+        self._session = session
+        self._conversation.append({"role": "user", "content": question})
+        self._conversation.append({"role": "assistant", "content": answer})
+        self._show_answer(answer, log_path)
 
     def _append_status(self, message: str, kind: str = "info", widget_key: str | None = None) -> None:
         if kind == "markup":
