@@ -1,7 +1,7 @@
 [project]
-name = "ytqa"
+name = "ytask"
 version = "0.1.0"
-description = "YouTube transcript Q&A CLI using Claude"
+description = "YouTube research assistant — search, synthesise, and converse using transcripts"
 requires-python = ">=3.10"
 dependencies = [
     "youtube-transcript-api",
