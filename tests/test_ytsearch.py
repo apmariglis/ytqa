@@ -841,11 +841,11 @@ def test_run_agent_loop_uses_skip_kind_when_no_captions_available(mocker):
 
     run_agent_loop(
         SEARCH_QUERY, client, DEFAULT_MODEL,
-        status_callback=lambda msg, kind="info": status_events.append((msg, kind)),
+        status_callback=lambda msg, kind="info", **kw: status_events.append((msg, kind)),
     )
 
-    skip_events = [(m, k) for m, k in status_events if k == "skip"]
-    assert len(skip_events) >= 1
+    no_caption_events = [m for m, k in status_events if "no captions" in m.lower()]
+    assert len(no_caption_events) >= 1
 
 
 def test_run_agent_loop_reports_no_captions_message_in_status(mocker):

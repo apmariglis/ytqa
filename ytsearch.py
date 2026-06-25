@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import yt_dlp
-from youtube_transcript_api import CouldNotRetrieveTranscript
+from youtube_transcript_api import CouldNotRetrieveTranscript, IpBlocked, RequestBlocked
 from dotenv import load_dotenv
 import anthropic
 from textual.app import App, ComposeResult
@@ -475,19 +475,41 @@ def run_agent_loop(
                     title=title,
                     status="success",
                 )
-        except CouldNotRetrieveTranscript:
-            if status_callback:
-                status_callback(f"No captions: {title}", "skip")
-            if session_log:
-                session_log.record(
-                    "transcript_fetch",
-                    video_id=video_id,
-                    title=title,
-                    status="no_captions",
-                )
+        except CouldNotRetrieveTranscript as exc:
+            exc_msg = str(exc).lower()
+            is_ip_issue = isinstance(exc, (IpBlocked, RequestBlocked)) or (
+                "ip" in exc_msg and "block" in exc_msg
+            )
+            if is_ip_issue:
+                _ip_blocked.set()
+                if status_callback:
+                    status_callback(f"[red]IP blocked: {escape(title)}[/red]", "markup", widget_key=video_id)
+                if session_log:
+                    session_log.record(
+                        "transcript_fetch",
+                        video_id=video_id,
+                        title=title,
+                        status="ip_blocked",
+                    )
+            else:
+                reason = _no_transcript_reason(exc)
+                if status_callback:
+                    status_callback(
+                        f"[yellow]No captions:[/yellow] {escape(title)} [dim]— {escape(reason)}[/dim]",
+                        "markup",
+                        widget_key=video_id,
+                    )
+                if session_log:
+                    session_log.record(
+                        "transcript_fetch",
+                        video_id=video_id,
+                        title=title,
+                        status="no_captions",
+                        reason=reason,
+                    )
         except Exception as exc:
             if status_callback:
-                status_callback(f"Failed: {title}", "error")
+                status_callback(f"Failed: {title}", "error", widget_key=video_id)
             if session_log:
                 session_log.record(
                     "transcript_fetch",
@@ -504,6 +526,20 @@ def run_agent_loop(
         }
         for future in as_completed(futures):
             future.result()  # exceptions are handled inside _fetch_one
+
+    if _ip_blocked.is_set() and status_callback:
+        status_callback(
+            "[red]YouTube blocked transcript requests from your IP.[/red] "
+            "[dim]Try disabling your VPN or running from a different network.[/dim]",
+            "markup",
+        )
+
+    # Append description segments so keyword matching also covers video descriptions.
+    for video_id, video in all_video_results.items():
+        if video.description:
+            desc_segs = _description_to_segments(video.description)
+            if desc_segs:
+                segments_by_id[video_id] = segments_by_id.get(video_id, []) + desc_segs
 
     # --- Phase 4: Keyword matching ---
     if status_callback:
