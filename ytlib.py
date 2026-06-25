@@ -51,16 +51,55 @@ def fetch_video_title(video_id: str) -> str:
     return video_id
 
 
+def _pick_transcript_auto(available: list) -> tuple[object, str]:
+    """
+    Pick the best transcript for automated use, translating to English via
+    YouTube's translation endpoint when no English transcript exists.
+
+    Returns (transcript, description) where description is a short human-readable
+    string like "manual EN" or "auto-generated PT → EN".
+
+    Priority:
+    1. Manual English
+    2. Auto-generated English
+    3. Manual (any language) — translated to English
+    4. Auto-generated (any language) — translated to English
+    5. Manual (any language) — untranslated fallback
+    6. Auto-generated (any language) — untranslated fallback
+    """
+    manual = [t for t in available if not t.is_generated]
+    generated = [t for t in available if t.is_generated]
+
+    manual_en = [t for t in manual if t.language_code.startswith("en")]
+    if manual_en:
+        return manual_en[0], "manual EN"
+
+    generated_en = [t for t in generated if t.language_code.startswith("en")]
+    if generated_en:
+        return generated_en[0], "auto-generated EN"
+
+    manual_translatable = [t for t in manual if t.is_translatable]
+    if manual_translatable:
+        t = manual_translatable[0]
+        return t.translate("en"), f"manual {t.language_code} → EN"
+
+    generated_translatable = [t for t in generated if t.is_translatable]
+    if generated_translatable:
+        t = generated_translatable[0]
+        return t.translate("en"), f"auto-generated {t.language_code} → EN"
+
+    fallback = (manual + generated)[0]
+    kind = "auto-generated" if fallback.is_generated else "manual"
+    return fallback, f"{kind} {fallback.language_code}"
+
+
 def pick_transcript(available: list, auto: bool = False) -> object:
     if len(available) == 1:
         return available[0]
 
     if auto:
-        # Prefer manual transcripts (non-generated), then English, then first.
-        manual = [t for t in available if not t.is_generated]
-        pool = manual if manual else available
-        english = [t for t in pool if t.language_code.startswith("en")]
-        return english[0] if english else pool[0]
+        transcript, _ = _pick_transcript_auto(available)
+        return transcript
 
     print("\nMultiple transcripts available:")
     for i, t in enumerate(available):
@@ -78,11 +117,22 @@ def _seconds_to_timestamp(seconds: float) -> str:
     return f"{total // 60}:{total % 60:02d}"
 
 
-def fetch_and_save_transcript(video_id: str, auto: bool = False) -> str:
+def fetch_and_save_transcript(video_id: str, auto: bool = False) -> tuple[str, str | None]:
+    """Return (transcript_text, source_description).
+
+    source_description is a short human-readable string such as "manual EN" or
+    "auto-generated PT → EN" when auto=True, or None for interactive selection.
+    """
     api = YouTubeTranscriptApi()
     transcript_list = api.list(video_id)
     available = list(transcript_list)
-    chosen = pick_transcript(available, auto=auto)
+
+    if auto:
+        chosen, description = _pick_transcript_auto(available)
+    else:
+        chosen = pick_transcript(available, auto=False)
+        description = None
+
     fetched = chosen.fetch()
 
     TRANSCRIPTS_DIR.mkdir(exist_ok=True)
@@ -96,7 +146,7 @@ def fetch_and_save_transcript(video_id: str, auto: bool = False) -> str:
     transcript_path = TRANSCRIPTS_DIR / f"{video_id}.txt"
     transcript_path.write_text(transcript, encoding="utf-8")
 
-    return transcript
+    return transcript, description
 
 
 def load_transcript_segments(video_id: str) -> list[dict] | None:
@@ -116,14 +166,15 @@ def format_transcript_with_timestamps(segments: list[dict]) -> str:
     )
 
 
-def load_transcript(video_id: str, auto: bool = False) -> tuple[str, bool]:
-    """Return (transcript_text, from_cache).
+def load_transcript(video_id: str, auto: bool = False) -> tuple[str, bool, str | None]:
+    """Return (transcript_text, from_cache, source_description).
 
-    When auto=True, multiple transcript tracks are selected automatically
-    (manual > English > first) without prompting the user.
+    source_description is None for cache hits and a human-readable string like
+    "auto-generated EN" for fresh fetches.
     """
     transcript_path = TRANSCRIPTS_DIR / f"{video_id}.txt"
     if transcript_path.exists():
-        return transcript_path.read_text(encoding="utf-8"), True
+        return transcript_path.read_text(encoding="utf-8"), True, None
 
-    return fetch_and_save_transcript(video_id, auto=auto), False
+    text, description = fetch_and_save_transcript(video_id, auto=auto)
+    return text, False, description
