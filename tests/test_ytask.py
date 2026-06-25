@@ -1,5 +1,5 @@
 """
-Tests for ytsearch.py.
+Tests for ytask.py.
 
 Group A  — VideoResult dataclass
 Group B  — search_youtube() normal results
@@ -24,15 +24,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-import ytsearch
-from ytsearch import (
+import ytask
+from ytask import (
     VideoResult,
     SearchError,
+    SearchSession,
     build_plan_tool_definition,
     extract_keyword_windows,
     build_video_excerpts,
     fetch_transcripts_for_videos,
     run_agent_loop,
+    run_followup,
     search_youtube,
 )
 from ytlog import SessionLog
@@ -117,7 +119,7 @@ def _mock_ydl(mocker, entries: list[dict] | None) -> MagicMock:
     info = {"entries": entries}
     mock_instance = MagicMock()
     mock_instance.extract_info.return_value = info
-    mock_class = mocker.patch("ytsearch.yt_dlp.YoutubeDL")
+    mock_class = mocker.patch("ytask.yt_dlp.YoutubeDL")
     mock_class.return_value.__enter__.return_value = mock_instance
     mock_class.return_value.__exit__.return_value = False
     return mock_instance
@@ -231,7 +233,7 @@ def test_search_youtube_handles_missing_view_count_field(mocker):
 def test_search_youtube_raises_search_error_when_yt_dlp_raises_download_error(mocker):
     import yt_dlp
 
-    mock_class = mocker.patch("ytsearch.yt_dlp.YoutubeDL")
+    mock_class = mocker.patch("ytask.yt_dlp.YoutubeDL")
     mock_instance = MagicMock()
     mock_instance.extract_info.side_effect = yt_dlp.utils.DownloadError("network error")
     mock_class.return_value.__enter__.return_value = mock_instance
@@ -252,7 +254,7 @@ def test_search_youtube_returns_empty_list_when_yt_dlp_returns_no_entries(mocker
 def test_search_youtube_returns_empty_list_when_yt_dlp_entries_key_is_none(mocker):
     mock_instance = MagicMock()
     mock_instance.extract_info.return_value = {"entries": None}
-    mock_class = mocker.patch("ytsearch.yt_dlp.YoutubeDL")
+    mock_class = mocker.patch("ytask.yt_dlp.YoutubeDL")
     mock_class.return_value.__enter__.return_value = mock_instance
     mock_class.return_value.__exit__.return_value = False
 
@@ -270,7 +272,7 @@ TRANSCRIPT_TEXT = "Hello world transcript."
 
 
 def test_fetch_transcripts_for_videos_returns_dict_keyed_by_video_id(mocker):
-    mocker.patch("ytsearch.load_transcript", return_value=(TRANSCRIPT_TEXT, True, None))
+    mocker.patch("ytask.load_transcript", return_value=(TRANSCRIPT_TEXT, True, None))
 
     result = fetch_transcripts_for_videos([TRANSCRIPT_VIDEO_ID])
 
@@ -278,7 +280,7 @@ def test_fetch_transcripts_for_videos_returns_dict_keyed_by_video_id(mocker):
 
 
 def test_fetch_transcripts_for_videos_calls_load_transcript_once_per_video_id(mocker):
-    mock_load = mocker.patch("ytsearch.load_transcript", return_value=(TRANSCRIPT_TEXT, True, None))
+    mock_load = mocker.patch("ytask.load_transcript", return_value=(TRANSCRIPT_TEXT, True, None))
 
     fetch_transcripts_for_videos(["vid_a1bbbbbbb", "vid_b2ccccccc"])
 
@@ -292,7 +294,7 @@ def test_fetch_transcripts_for_videos_skips_videos_where_transcript_fetch_fails(
             raise RuntimeError("transcript unavailable")
         return (TRANSCRIPT_TEXT, False, None)
 
-    mocker.patch("ytsearch.load_transcript", side_effect=load_side_effect)
+    mocker.patch("ytask.load_transcript", side_effect=load_side_effect)
 
     result = fetch_transcripts_for_videos(["bad_vid_aaaa", "good_vid_aaa"])
 
@@ -301,7 +303,7 @@ def test_fetch_transcripts_for_videos_skips_videos_where_transcript_fetch_fails(
 
 
 def test_fetch_transcripts_for_videos_returns_empty_dict_for_empty_input(mocker):
-    mock_load = mocker.patch("ytsearch.load_transcript")
+    mock_load = mocker.patch("ytask.load_transcript")
 
     result = fetch_transcripts_for_videos([])
 
@@ -616,7 +618,7 @@ def _make_client(*responses) -> MagicMock:
 def test_run_agent_loop_makes_planning_call_with_plan_search_tool(mocker):
     # First Claude call must offer the plan_search tool so Claude can specify
     # what to search for and what keywords to look for in transcripts.
-    mocker.patch("ytsearch.search_youtube", return_value=[])
+    mocker.patch("ytask.search_youtube", return_value=[])
     client = _make_client(
         _plan_response(["python GIL"], ["GIL"]),
         _make_synthesis_response("No info found."),
@@ -631,7 +633,7 @@ def test_run_agent_loop_makes_planning_call_with_plan_search_tool(mocker):
 
 def test_run_agent_loop_calls_search_youtube_for_each_query_in_plan(mocker):
     # One search_youtube call must be made per query returned by the planning step.
-    mock_search = mocker.patch("ytsearch.search_youtube", return_value=[])
+    mock_search = mocker.patch("ytask.search_youtube", return_value=[])
     client = _make_client(
         _plan_response(["python GIL", "GIL threading python"], ["GIL"]),
         _make_synthesis_response("Answer."),
@@ -649,9 +651,9 @@ def test_run_agent_loop_deduplicates_videos_from_multiple_searches(mocker):
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[shared_video])
-    mock_load = mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
-    mocker.patch("ytsearch.load_transcript_segments", return_value=None)
+    mocker.patch("ytask.search_youtube", return_value=[shared_video])
+    mock_load = mocker.patch("ytask.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
+    mocker.patch("ytask.load_transcript_segments", return_value=None)
     client = _make_client(
         _plan_response(["query one", "query two"], ["GIL"]),
         _make_synthesis_response("Answer."),
@@ -664,7 +666,7 @@ def test_run_agent_loop_deduplicates_videos_from_multiple_searches(mocker):
 
 def test_run_agent_loop_reports_each_search_query_via_status_callback(mocker):
     # The TUI should show which queries are being executed as they run.
-    mocker.patch("ytsearch.search_youtube", return_value=[])
+    mocker.patch("ytask.search_youtube", return_value=[])
     status_events: list[tuple[str, str]] = []
     client = _make_client(
         _plan_response(["python GIL", "global interpreter lock"], ["GIL"]),
@@ -686,9 +688,9 @@ def test_run_agent_loop_reports_found_video_title_and_url_via_status_callback(mo
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
-    mocker.patch("ytsearch.load_transcript_segments", return_value=None)
+    mocker.patch("ytask.search_youtube", return_value=[search_result])
+    mocker.patch("ytask.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
+    mocker.patch("ytask.load_transcript_segments", return_value=None)
     status_events: list[tuple[str, str]] = []
     client = _make_client(
         _plan_response(["Python GIL"], ["GIL"]),
@@ -719,13 +721,13 @@ def _setup_synthesis_scenario(mocker):
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
+    mocker.patch("ytask.search_youtube", return_value=[search_result])
     mock_load = mocker.patch(
-        "ytsearch.load_transcript",
+        "ytask.load_transcript",
         return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"),
     )
     # Segments contain "GIL" and "mutex" — both are in PLAN_KEYWORDS.
-    mocker.patch("ytsearch.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
+    mocker.patch("ytask.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
 
     client = _make_client(
         _plan_response(["Python GIL"], ["GIL", "mutex"]),
@@ -761,9 +763,9 @@ def test_run_agent_loop_includes_keyword_matched_excerpts_in_synthesis_prompt(mo
 def test_run_agent_loop_returns_text_from_claude_synthesis_response(mocker):
     client, _ = _setup_synthesis_scenario(mocker)
 
-    result = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+    session = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
 
-    assert result == SYNTHESIS_ANSWER
+    assert session.answer == SYNTHESIS_ANSWER
 
 
 def test_run_agent_loop_includes_video_title_and_url_in_synthesis_context(mocker):
@@ -831,8 +833,8 @@ def test_run_agent_loop_uses_skip_kind_when_no_captions_available(mocker):
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
+    mocker.patch("ytask.search_youtube", return_value=[search_result])
+    mocker.patch("ytask.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
     status_events: list[tuple[str, str]] = []
     client = _make_client(
         _plan_response(["Python GIL"], ["GIL"]),
@@ -856,8 +858,8 @@ def test_run_agent_loop_reports_no_captions_message_in_status(mocker):
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
+    mocker.patch("ytask.search_youtube", return_value=[search_result])
+    mocker.patch("ytask.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
     status_events: list[tuple[str, str]] = []
     client = _make_client(
         _plan_response(["Python GIL"], ["GIL"]),
@@ -880,10 +882,10 @@ def test_run_agent_loop_skips_videos_with_no_keyword_matches_in_synthesis(mocker
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
+    mocker.patch("ytask.search_youtube", return_value=[search_result])
+    mocker.patch("ytask.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
     # Segments contain no keyword match for "asyncio".
-    mocker.patch("ytsearch.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
+    mocker.patch("ytask.load_transcript_segments", return_value=SEGMENTS_WITH_TIMESTAMPS)
     client = _make_client(
         _plan_response(["Python asyncio"], ["asyncio", "event loop"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
@@ -926,23 +928,23 @@ def _make_retrying_client(failing_status_code: int, fail_times: int, success_res
 
 def test_create_with_retry_returns_response_on_first_success(mocker):
     # When the API succeeds immediately, the response is returned without retrying.
-    mocker.patch("ytsearch.time.sleep")
+    mocker.patch("ytask.time.sleep")
     client = MagicMock()
     expected = MagicMock()
     client.messages.create.return_value = expected
 
-    result = ytsearch._create_with_retry(client, model="m", messages=[])
+    result = ytask._create_with_retry(client, model="m", messages=[])
 
     assert result is expected
 
 
 def test_create_with_retry_retries_on_529_and_eventually_succeeds(mocker):
     # A single 529 (overloaded) should be retried and succeed on the next attempt.
-    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    mock_sleep = mocker.patch("ytask.time.sleep")
     success = MagicMock()
     client = _make_retrying_client(failing_status_code=529, fail_times=1, success_response=success)
 
-    result = ytsearch._create_with_retry(client, model="m", messages=[])
+    result = ytask._create_with_retry(client, model="m", messages=[])
 
     assert result is success
     mock_sleep.assert_called_once()
@@ -950,11 +952,11 @@ def test_create_with_retry_retries_on_529_and_eventually_succeeds(mocker):
 
 def test_create_with_retry_retries_on_429_and_eventually_succeeds(mocker):
     # 429 (rate limited) is also retryable and should be handled the same way.
-    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    mock_sleep = mocker.patch("ytask.time.sleep")
     success = MagicMock()
     client = _make_retrying_client(failing_status_code=429, fail_times=1, success_response=success)
 
-    result = ytsearch._create_with_retry(client, model="m", messages=[])
+    result = ytask._create_with_retry(client, model="m", messages=[])
 
     assert result is success
     mock_sleep.assert_called_once()
@@ -962,11 +964,11 @@ def test_create_with_retry_retries_on_429_and_eventually_succeeds(mocker):
 
 def test_create_with_retry_uses_exponential_backoff(mocker):
     # Each retry waits 2^attempt seconds: 1st retry waits 1s, 2nd waits 2s.
-    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    mock_sleep = mocker.patch("ytask.time.sleep")
     success = MagicMock()
     client = _make_retrying_client(failing_status_code=529, fail_times=2, success_response=success)
 
-    ytsearch._create_with_retry(client, model="m", messages=[])
+    ytask._create_with_retry(client, model="m", messages=[])
 
     sleep_calls = [call.args[0] for call in mock_sleep.call_args_list]
     assert sleep_calls == [1, 2]
@@ -974,34 +976,34 @@ def test_create_with_retry_uses_exponential_backoff(mocker):
 
 def test_create_with_retry_raises_after_max_retries_exhausted(mocker):
     # If the API keeps returning 529 beyond the retry limit, the error propagates.
-    mocker.patch("ytsearch.time.sleep")
+    mocker.patch("ytask.time.sleep")
     client = MagicMock()
     client.messages.create.side_effect = _FakeAPIError(529)
 
     with pytest.raises(_FakeAPIError):
-        ytsearch._create_with_retry(client, model="m", messages=[])
+        ytask._create_with_retry(client, model="m", messages=[])
 
 
 def test_create_with_retry_does_not_retry_non_transient_errors(mocker):
     # A 400 bad request should not be retried — it is a permanent client error.
-    mock_sleep = mocker.patch("ytsearch.time.sleep")
+    mock_sleep = mocker.patch("ytask.time.sleep")
     client = MagicMock()
     client.messages.create.side_effect = _FakeAPIError(400)
 
     with pytest.raises(_FakeAPIError):
-        ytsearch._create_with_retry(client, model="m", messages=[])
+        ytask._create_with_retry(client, model="m", messages=[])
 
     mock_sleep.assert_not_called()
 
 
 def test_create_with_retry_notifies_status_callback_before_each_retry(mocker):
     # Status callback is called so the TUI can show the user a "retrying" message.
-    mocker.patch("ytsearch.time.sleep")
+    mocker.patch("ytask.time.sleep")
     success = MagicMock()
     client = _make_retrying_client(failing_status_code=529, fail_times=1, success_response=success)
     status_events: list[tuple[str, str]] = []
 
-    ytsearch._create_with_retry(
+    ytask._create_with_retry(
         client,
         lambda msg, kind="info", **kw: status_events.append((msg, kind)),
         model="m",
@@ -1018,7 +1020,7 @@ def test_create_with_retry_notifies_status_callback_before_each_retry(mocker):
 
 def _patch_app(mocker) -> MagicMock:
     """Replace YtsearchApp so we don't spin up a real TUI."""
-    mock_app_class = mocker.patch("ytsearch.YtsearchApp")
+    mock_app_class = mocker.patch("ytask.YtsearchApp")
     mock_app_instance = MagicMock()
     mock_app_class.return_value = mock_app_instance
     return mock_app_class
@@ -1026,11 +1028,11 @@ def _patch_app(mocker) -> MagicMock:
 
 def test_main_reads_query_from_command_line_argument_when_provided(mocker):
     mocker.patch.dict("os.environ", {"YTQA_MODEL": "claude-3-opus-20240229"})
-    mocker.patch("ytsearch.anthropic.Anthropic")
+    mocker.patch("ytask.anthropic.Anthropic")
     mock_app_class = _patch_app(mocker)
 
-    with patch.object(sys, "argv", ["ytsearch.py", "python", "GIL"]):
-        ytsearch.main()
+    with patch.object(sys, "argv", ["ytask.py", "python", "GIL"]):
+        ytask.main()
 
     mock_app_class.assert_called_once()
     call_kwargs = mock_app_class.call_args.kwargs
@@ -1039,12 +1041,12 @@ def test_main_reads_query_from_command_line_argument_when_provided(mocker):
 
 def test_main_prompts_for_query_via_input_when_no_argument_given(mocker):
     mocker.patch.dict("os.environ", {"YTQA_MODEL": "claude-3-opus-20240229"})
-    mocker.patch("ytsearch.anthropic.Anthropic")
+    mocker.patch("ytask.anthropic.Anthropic")
     mock_app_class = _patch_app(mocker)
     mocker.patch("builtins.input", return_value="what is asyncio")
 
-    with patch.object(sys, "argv", ["ytsearch.py"]):
-        ytsearch.main()
+    with patch.object(sys, "argv", ["ytask.py"]):
+        ytask.main()
 
     mock_app_class.assert_called_once()
     call_kwargs = mock_app_class.call_args.kwargs
@@ -1058,7 +1060,7 @@ def test_main_prompts_for_query_via_input_when_no_argument_given(mocker):
 def test_run_agent_loop_records_claude_planning_response_in_session_log(mocker, tmp_path):
     # The planning call result must be captured to review what search strategy
     # and keywords Claude chose — essential for evaluating agent quality.
-    mocker.patch("ytsearch.search_youtube", return_value=[])
+    mocker.patch("ytask.search_youtube", return_value=[])
     client = _make_client(
         _plan_response(["python GIL"], ["GIL"]),
         _make_synthesis_response("No results."),
@@ -1080,9 +1082,9 @@ def test_run_agent_loop_records_youtube_search_query_and_results_in_session_log(
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
-    mocker.patch("ytsearch.load_transcript_segments", return_value=None)
+    mocker.patch("ytask.search_youtube", return_value=[search_result])
+    mocker.patch("ytask.load_transcript", return_value=(SELECTED_TRANSCRIPT, False, "auto-generated EN"))
+    mocker.patch("ytask.load_transcript_segments", return_value=None)
     client = _make_client(
         _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
@@ -1117,8 +1119,8 @@ def test_run_agent_loop_records_transcript_no_captions_in_session_log(mocker, tm
         video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE, url=SELECTED_VIDEO_URL,
         description=None, view_count=None, duration_seconds=None,
     )
-    mocker.patch("ytsearch.search_youtube", return_value=[search_result])
-    mocker.patch("ytsearch.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
+    mocker.patch("ytask.search_youtube", return_value=[search_result])
+    mocker.patch("ytask.load_transcript", side_effect=CouldNotRetrieveTranscript(SELECTED_VIDEO_ID))
     client = _make_client(
         _plan_response(["Python GIL"], ["GIL"]),
         _make_synthesis_response(SYNTHESIS_ANSWER),
@@ -1156,3 +1158,224 @@ def test_run_agent_loop_records_synthesis_output_answer_in_session_log(mocker, t
     synthesis_output_events = [e for e in log.events if e["type"] == "synthesis_output"]
     assert len(synthesis_output_events) == 1
     assert synthesis_output_events[0]["answer"] == SYNTHESIS_ANSWER
+
+
+# ===========================================================================
+# Group Q — SearchSession returned by run_agent_loop()
+# ===========================================================================
+
+def test_run_agent_loop_returns_search_session_object(mocker):
+    # run_agent_loop must return a SearchSession so the TUI can continue
+    # the conversation with accumulated context across follow-up turns.
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    result = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    assert isinstance(result, SearchSession)
+
+
+def test_run_agent_loop_search_session_answer_equals_synthesis_text(mocker):
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    session = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    assert session.answer == SYNTHESIS_ANSWER
+
+
+def test_run_agent_loop_search_session_contains_transcript_keywords(mocker):
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    session = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    assert "GIL" in session.transcript_keywords
+
+
+def test_run_agent_loop_search_session_contains_transcript_context(mocker):
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    session = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    assert SELECTED_VIDEO_TITLE in session.transcript_context
+
+
+def test_run_agent_loop_search_session_contains_video_results(mocker):
+    client, _ = _setup_synthesis_scenario(mocker)
+
+    session = run_agent_loop(SEARCH_QUERY, client, DEFAULT_MODEL)
+
+    assert SELECTED_VIDEO_ID in session.all_video_results
+
+
+# ===========================================================================
+# Group R — run_followup() basic behavior (no new searches)
+# ===========================================================================
+
+# Shared fixtures for follow-up tests.
+FOLLOWUP_QUESTION = "What about GIL in Python 3.13?"
+FOLLOWUP_ANSWER = "Python 3.13 introduces optional GIL disabling."
+FOLLOWUP_CONTEXT = (
+    f"## {SELECTED_VIDEO_TITLE}\nURL: {SELECTED_VIDEO_URL}\n\n"
+    "Relevant excerpts:\n[2:15] The GIL is a mutex."
+)
+FOLLOWUP_CONVERSATION = [
+    {"role": "user", "content": SEARCH_QUERY},
+    {"role": "assistant", "content": SYNTHESIS_ANSWER},
+]
+
+
+def _make_followup_session() -> SearchSession:
+    return SearchSession(
+        answer=SYNTHESIS_ANSWER,
+        segments_by_id={SELECTED_VIDEO_ID: SEGMENTS_WITH_TIMESTAMPS},
+        all_video_results={
+            SELECTED_VIDEO_ID: VideoResult(
+                video_id=SELECTED_VIDEO_ID, title=SELECTED_VIDEO_TITLE,
+                url=SELECTED_VIDEO_URL, description=None,
+                view_count=None, duration_seconds=None,
+            )
+        },
+        transcript_context=FOLLOWUP_CONTEXT,
+        transcript_keywords=["GIL", "mutex"],
+    )
+
+
+def test_run_followup_returns_answer_string(mocker):
+    # The first element of the return tuple must be the text answer Claude provides.
+    client = _make_client(_make_synthesis_response(FOLLOWUP_ANSWER))
+
+    answer, _ = run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    assert answer == FOLLOWUP_ANSWER
+
+
+def test_run_followup_returns_updated_search_session(mocker):
+    # The second element must be a SearchSession carrying accumulated context.
+    client = _make_client(_make_synthesis_response(FOLLOWUP_ANSWER))
+
+    _, updated = run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    assert isinstance(updated, SearchSession)
+
+
+def test_run_followup_sends_conversation_history_to_claude(mocker):
+    # The original query and answer must appear in the messages sent to Claude
+    # so it has the full conversation context when answering the follow-up.
+    client = _make_client(_make_synthesis_response(FOLLOWUP_ANSWER))
+
+    run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    messages = client.messages.create.call_args.kwargs["messages"]
+    user_contents = [m["content"] for m in messages if m["role"] == "user" and isinstance(m.get("content"), str)]
+    assert any(SEARCH_QUERY in c for c in user_contents)
+
+
+def test_run_followup_includes_existing_context_in_system_prompt(mocker):
+    # Transcript excerpts from prior searches must be in the system prompt
+    # so Claude can cite them without re-fetching.
+    client = _make_client(_make_synthesis_response(FOLLOWUP_ANSWER))
+
+    run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    system = client.messages.create.call_args.kwargs["system"]
+    assert FOLLOWUP_CONTEXT in system
+
+
+def test_run_followup_provides_youtube_search_tool_to_claude(mocker):
+    # Claude must have the youtube_search tool available so it can fetch
+    # additional content when the existing excerpts are insufficient.
+    client = _make_client(_make_synthesis_response(FOLLOWUP_ANSWER))
+
+    run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    tool_names = [t["name"] for t in client.messages.create.call_args.kwargs["tools"]]
+    assert "youtube_search" in tool_names
+
+
+# ===========================================================================
+# Group S — run_followup() when Claude searches YouTube for more content
+# ===========================================================================
+
+NEW_VIDEO_ID = "new_vid_zzzzz"
+NEW_VIDEO_TITLE = "GIL in Python 3.13 explained"
+NEW_VIDEO_URL = f"https://www.youtube.com/watch?v={NEW_VIDEO_ID}"
+NEW_VIDEO_TRANSCRIPT = "Python 3.13 allows disabling the GIL."
+NEW_VIDEO_SEGMENTS = [{"start": 10.0, "text": "Python 3.13 allows disabling the GIL."}]
+SEARCH_TOOL_USE_ID = "tu_search_001"
+
+
+def _followup_search_response(query: str = "GIL Python 3.13") -> FakeResponse:
+    return FakeResponse(
+        stop_reason="tool_use",
+        content=[FakeToolUseBlock(id=SEARCH_TOOL_USE_ID, name="youtube_search", input={"query": query})],
+    )
+
+
+def _new_video() -> VideoResult:
+    return VideoResult(
+        video_id=NEW_VIDEO_ID, title=NEW_VIDEO_TITLE, url=NEW_VIDEO_URL,
+        description=None, view_count=None, duration_seconds=None,
+    )
+
+
+def test_run_followup_calls_search_youtube_with_claude_query(mocker):
+    # When Claude emits a youtube_search tool call, search_youtube must be
+    # invoked with the exact query Claude specified.
+    mock_search = mocker.patch("ytask.search_youtube", return_value=[_new_video()])
+    mocker.patch("ytask.load_transcript", return_value=(NEW_VIDEO_TRANSCRIPT, False, None))
+    mocker.patch("ytask.load_transcript_segments", return_value=NEW_VIDEO_SEGMENTS)
+    client = _make_client(_followup_search_response("GIL Python 3.13"), _make_synthesis_response(FOLLOWUP_ANSWER))
+
+    run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    mock_search.assert_called_once()
+    assert mock_search.call_args[0][0] == "GIL Python 3.13"
+
+
+def test_run_followup_fetches_transcript_for_newly_found_video(mocker):
+    # Transcripts for videos returned by the search must be loaded so their
+    # content can be included in the updated context for the next Claude call.
+    mocker.patch("ytask.search_youtube", return_value=[_new_video()])
+    mock_load = mocker.patch("ytask.load_transcript", return_value=(NEW_VIDEO_TRANSCRIPT, False, None))
+    mocker.patch("ytask.load_transcript_segments", return_value=NEW_VIDEO_SEGMENTS)
+    client = _make_client(_followup_search_response(), _make_synthesis_response(FOLLOWUP_ANSWER))
+
+    run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    mock_load.assert_called_once_with(NEW_VIDEO_ID, auto=True)
+
+
+def test_run_followup_adds_new_video_to_updated_session(mocker):
+    # The updated session returned must include the newly discovered video
+    # so subsequent follow-ups can reference it.
+    mocker.patch("ytask.search_youtube", return_value=[_new_video()])
+    mocker.patch("ytask.load_transcript", return_value=(NEW_VIDEO_TRANSCRIPT, False, None))
+    mocker.patch("ytask.load_transcript_segments", return_value=NEW_VIDEO_SEGMENTS)
+    client = _make_client(_followup_search_response(), _make_synthesis_response(FOLLOWUP_ANSWER))
+
+    _, updated = run_followup(
+        FOLLOWUP_QUESTION, _make_followup_session(), FOLLOWUP_CONVERSATION,
+        client, DEFAULT_MODEL,
+    )
+
+    assert NEW_VIDEO_ID in updated.all_video_results

@@ -55,10 +55,26 @@ excerpts allow, and state any gaps plainly within the answer itself.\
 """
 
 SYNTHESIS_MAX_TOKENS = 4096
+FOLLOWUP_MAX_TOKENS = 4096
 SEARCH_MAX_RESULTS = 10
 MAX_POOL_SIZE = 20          # max unique videos to fetch transcripts for
 MAX_CONCURRENT_FETCHES = 5  # parallel transcript fetches
 DEFAULT_WINDOW_SIZE = 3
+
+FOLLOWUP_SYSTEM_PROMPT = """\
+You are a YouTube research assistant continuing a conversation.
+
+The transcript excerpts below are from videos already fetched during this session. \
+Use them to answer follow-up questions directly when possible. If the existing excerpts \
+do not contain enough information, use the youtube_search tool to find additional videos \
+— their transcripts will be fetched automatically and added to the context above.
+
+Cite specific claims with the source video and nearest timestamp: ([Title](URL) ~M:SS)
+
+--- Transcript excerpts ---
+
+{context}
+"""
 
 # Maps status kind → Rich markup tag used in the TUI.
 _STATUS_MARKUP: dict[str, str] = {
@@ -118,6 +134,16 @@ Input {
 
 _RETRYABLE_STATUS_CODES = {429, 529}
 _MAX_API_RETRIES = 5
+
+
+@dataclass
+class SearchSession:
+    """Accumulated state from one research session, enabling follow-up conversation."""
+    answer: str
+    segments_by_id: dict  # video_id -> list of segment dicts
+    all_video_results: dict  # video_id -> VideoResult
+    transcript_context: str  # formatted excerpts used for synthesis
+    transcript_keywords: list  # keywords planned in the initial search phase
 
 
 @dataclass
@@ -239,6 +265,26 @@ def build_plan_tool_definition() -> dict:
                 },
             },
             "required": ["search_queries", "transcript_keywords"],
+        },
+    }
+
+
+def build_youtube_search_tool_definition() -> dict:
+    return {
+        "name": "youtube_search",
+        "description": (
+            "Search YouTube for videos relevant to the user's question. "
+            "Use this when the existing transcript excerpts don't cover the topic."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The YouTube search query.",
+                },
+            },
+            "required": ["query"],
         },
     }
 
@@ -630,12 +676,149 @@ def run_agent_loop(
     if session_log:
         session_log.record("synthesis_output", answer=answer)
 
-    return answer
+    return SearchSession(
+        answer=answer,
+        segments_by_id=segments_by_id,
+        all_video_results=all_video_results,
+        transcript_context=transcript_context,
+        transcript_keywords=transcript_keywords,
+    )
+
+
+def run_followup(
+    question: str,
+    session: SearchSession,
+    conversation_history: list[dict],
+    client,
+    model: str,
+    status_callback=None,
+    session_log: SessionLog | None = None,
+    window_size: int = DEFAULT_WINDOW_SIZE,
+) -> tuple[str, SearchSession]:
+    """Answer a follow-up question using accumulated context, searching YouTube if needed."""
+    pricing = fetch_model_pricing(model)
+    cost_tracker = _CostTracker(*pricing) if pricing else None
+
+    # Working copies — do not mutate the caller's session.
+    segments_by_id = dict(session.segments_by_id)
+    all_video_results = dict(session.all_video_results)
+    transcript_context = session.transcript_context
+
+    messages = list(conversation_history) + [{"role": "user", "content": question}]
+
+    if status_callback:
+        status_callback("Answering follow-up", "phase")
+
+    while True:
+        system = FOLLOWUP_SYSTEM_PROMPT.format(context=transcript_context)
+        response = _create_with_retry(
+            client,
+            status_callback,
+            cost_tracker,
+            model=model,
+            max_tokens=FOLLOWUP_MAX_TOKENS,
+            system=system,
+            tools=[build_youtube_search_tool_definition()],
+            messages=messages,
+        )
+
+        # Find tool_use block, if any.
+        tool_block = next(
+            (b for b in response.content if getattr(b, "type", None) == "tool_use"),
+            None,
+        )
+
+        if tool_block is None:
+            # Claude answered directly — done.
+            answer = next(
+                (b.text for b in response.content if getattr(b, "type", None) == "text"),
+                "",
+            )
+            break
+
+        # Claude wants to search YouTube.
+        query = tool_block.input.get("query", "")
+        if status_callback:
+            status_callback(f'Searching YouTube: "{query}"', "info")
+
+        try:
+            results = search_youtube(query, SEARCH_MAX_RESULTS)
+        except SearchError:
+            results = []
+
+        # Append assistant tool_use message.
+        assistant_content = [
+            {"type": "tool_use", "id": tool_block.id, "name": tool_block.name, "input": tool_block.input}
+        ]
+        messages.append({"role": "assistant", "content": assistant_content})
+
+        # Fetch transcripts for newly discovered videos and extend context.
+        new_sections: list[str] = []
+        for r in results:
+            if r.video_id in all_video_results:
+                continue
+            all_video_results[r.video_id] = r
+            if status_callback:
+                status_callback(f"Fetching: {r.title}...", "info", widget_key=f"fu_{r.video_id}")
+            try:
+                _text, _, source = load_transcript(r.video_id, auto=True)
+                segs = load_transcript_segments(r.video_id)
+                if segs:
+                    segments_by_id[r.video_id] = segs
+                    excerpts_data = build_video_excerpts(
+                        {r.video_id: r},
+                        {r.video_id: segs},
+                        keywords=session.transcript_keywords,
+                        window_size=window_size,
+                    )
+                    if r.video_id in excerpts_data:
+                        excerpts_text = "\n".join(
+                            _format_excerpt_window(w)
+                            for w in excerpts_data[r.video_id]["excerpts"]
+                        )
+                        new_sections.append(
+                            f"## {r.title}\nURL: {r.url}\n\nRelevant excerpts:\n{excerpts_text}"
+                        )
+                suffix = f" ({source})" if source else ""
+                if status_callback:
+                    status_callback(
+                        f"[green]Loaded: {escape(r.title)}{suffix}[/green]", "markup",
+                        widget_key=f"fu_{r.video_id}",
+                    )
+            except CouldNotRetrieveTranscript:
+                if status_callback:
+                    status_callback(f"No captions: {r.title}", "skip", widget_key=f"fu_{r.video_id}")
+            except Exception:
+                if status_callback:
+                    status_callback(f"Failed: {r.title}", "error", widget_key=f"fu_{r.video_id}")
+
+        if new_sections:
+            transcript_context = transcript_context + "\n\n---\n\n" + "\n\n---\n\n".join(new_sections)
+
+        found_titles = ", ".join(r.title for r in results[:3]) or "none"
+        tool_result = f"Found {len(results)} video(s): {found_titles}. Relevant excerpts added to context."
+        messages.append({
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": tool_block.id, "content": tool_result}],
+        })
+
+    updated_session = SearchSession(
+        answer=answer,
+        segments_by_id=segments_by_id,
+        all_video_results=all_video_results,
+        transcript_context=transcript_context,
+        transcript_keywords=session.transcript_keywords,
+    )
+
+    if session_log:
+        session_log.record("followup_output", question=question, answer=answer)
+
+    return answer, updated_session
 
 
 class YtsearchApp(App):
     CSS = CSS
-    BINDINGS = [("ctrl+q", "quit", "Quit")]
+    BINDINGS = [("ctrl+q", "quit", "Quit"), ("ctrl+r", "new_search", "New search")]
 
     def __init__(self, client, model: str, initial_query: str | None = None) -> None:
         super().__init__()
