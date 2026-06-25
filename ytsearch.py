@@ -19,6 +19,7 @@ from textual import on, work
 from textual.markup import escape
 
 from ytlib import (
+    fetch_model_pricing,
     load_transcript,
     load_transcript_segments,
     MAX_TOKENS,
@@ -119,10 +120,39 @@ _RETRYABLE_STATUS_CODES = {429, 529}
 _MAX_API_RETRIES = 5
 
 
-def _create_with_retry(client, status_callback=None, **kwargs):
+@dataclass
+class _CostTracker:
+    input_cost_per_token: float
+    output_cost_per_token: float
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+
+    @property
+    def total_cost(self) -> float:
+        return (
+            self.total_input_tokens * self.input_cost_per_token
+            + self.total_output_tokens * self.output_cost_per_token
+        )
+
+    def add(self, usage) -> None:
+        self.total_input_tokens += getattr(usage, "input_tokens", 0)
+        self.total_output_tokens += getattr(usage, "output_tokens", 0)
+
+
+def _create_with_retry(client, status_callback=None, cost_tracker: _CostTracker | None = None, **kwargs):
     for attempt in range(_MAX_API_RETRIES):
         try:
-            return client.messages.create(**kwargs)
+            response = client.messages.create(**kwargs)
+            if cost_tracker is not None and hasattr(response, "usage"):
+                cost_tracker.add(response.usage)
+                if status_callback:
+                    in_tok = response.usage.input_tokens
+                    out_tok = response.usage.output_tokens
+                    status_callback(
+                        f"[dim]↳ {in_tok:,} in + {out_tok:,} out — ${cost_tracker.total_cost:.4f} total[/dim]",
+                        "markup",
+                    )
+            return response
         except Exception as exc:
             status_code = getattr(exc, "status_code", None)
             is_retryable = isinstance(status_code, int) and status_code in _RETRYABLE_STATUS_CODES
@@ -315,6 +345,9 @@ def run_agent_loop(
     session_log: SessionLog | None = None,
     window_size: int = DEFAULT_WINDOW_SIZE,
 ) -> str:
+    pricing = fetch_model_pricing(model)
+    cost_tracker = _CostTracker(*pricing) if pricing else None
+
     # --- Phase 1: Planning ---
     if status_callback:
         status_callback("Planning", "phase")
@@ -322,6 +355,7 @@ def run_agent_loop(
     plan_response = _create_with_retry(
         client,
         status_callback,
+        cost_tracker,
         model=model,
         max_tokens=MAX_TOKENS,
         system=PLANNING_SYSTEM_PROMPT,
@@ -491,6 +525,7 @@ def run_agent_loop(
     synthesis_response = _create_with_retry(
         client,
         status_callback,
+        cost_tracker,
         model=model,
         max_tokens=SYNTHESIS_MAX_TOKENS,
         system=SYNTHESIS_SYSTEM_PROMPT,
